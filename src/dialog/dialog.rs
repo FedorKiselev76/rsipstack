@@ -265,8 +265,9 @@ impl Dialog {
 
 #[derive(Clone)]
 pub(super) struct RemoteReliableState {
+    dialog_id: DialogId,
+    invite_cseq: u32,
     last_rseq: u32,
-    prack_request: Request,
 }
 
 /// Internal Dialog State and Management
@@ -329,7 +330,10 @@ pub struct DialogInner {
     // initial request updated when INVITE auth failed with new INVITE
     pub(super) initial_request: Mutex<Request>,
     pub(super) supports_100rel: bool,
-    pub(super) remote_reliable: Mutex<Option<RemoteReliableState>>,
+    pub(super) remote_reliable: Mutex<Vec<RemoteReliableState>>,
+    pub(super) reliable_clients: Mutex<BTreeMap<(DialogId, u32), super::reliable::ReliableClient>>,
+    pub(super) reliable_config: Mutex<Option<super::reliable::ReliableProvisionalConfig>>,
+    pub(super) reliable_servers: Mutex<BTreeMap<u32, Arc<super::reliable::ReliableServer>>>,
     /// The last ACK received for an INVITE or re-INVITE this dialog answered
     /// (UAS role). Carries the answer when the 2xx carried the offer.
     pub(super) remote_ack: Mutex<Option<Request>>,
@@ -501,7 +505,10 @@ impl DialogInner {
             local_contact,
             remote_contact: Mutex::new(None),
             supports_100rel,
-            remote_reliable: Mutex::new(None),
+            remote_reliable: Mutex::new(Vec::new()),
+            reliable_clients: Mutex::new(BTreeMap::new()),
+            reliable_config: Mutex::new(None),
+            reliable_servers: Mutex::new(BTreeMap::new()),
             remote_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
@@ -605,47 +612,95 @@ impl DialogInner {
         Ok(())
     }
 
-    fn clear_remote_reliable(&self) {
-        self.remote_reliable.lock().take();
+    pub(super) fn attach_reliable_server(self: &Arc<Self>, tx: &Transaction) -> Result<()> {
+        if tx.original.method != Method::Invite {
+            return Ok(());
+        }
+        let Some(config) = self.reliable_config.lock().clone() else {
+            return Ok(());
+        };
+        if !tx.original.header_contains_token("Supported", "100rel")
+            && !tx.original.header_contains_token("Require", "100rel")
+        {
+            return Ok(());
+        }
+        let cseq = tx.original.cseq_header()?.seq()?;
+        let mut servers = self.reliable_servers.lock();
+        let server = servers
+            .entry(cseq)
+            .or_insert_with(|| {
+                super::reliable::ReliableServer::new(
+                    self,
+                    tx.original.clone(),
+                    tx.tu_sender.clone(),
+                    config,
+                )
+            })
+            .clone();
+        *tx.reliable_provisional.lock() = Some(server);
+        Ok(())
+    }
+
+    pub(super) async fn receive_prack(&self, tx: &mut Transaction) -> Result<()> {
+        let Some((_, cseq, _)) = crate::sip::message::rack_parts(&tx.original) else {
+            return tx.reply(StatusCode::BadRequest).await;
+        };
+        let server = self.reliable_servers.lock().get(&cseq).cloned();
+        if let Some(server) = server {
+            server.handle_prack(tx).await
+        } else {
+            self.reject_unmatched_prack(tx).await
+        }
+    }
+
+    pub(super) fn clear_remote_reliable(&self, invite_cseq: u32) {
+        self.reliable_clients
+            .lock()
+            .retain(|(_, cseq), _| *cseq != invite_cseq);
+        self.remote_reliable
+            .lock()
+            .retain(|s| s.invite_cseq != invite_cseq);
     }
 
     pub(super) fn prepare_prack_request(&self, resp: &Response) -> Result<Option<Request>> {
-        if !resp.header_contains_token("Require", "100rel") {
+        if !(101..200).contains(&resp.status_code.code())
+            || !resp.header_contains_token("Require", "100rel")
+        {
             return Ok(None);
         }
-
         let Some(rseq) = resp.rseq_value() else {
-            warn!(
-                id = self.id.lock().to_string(),
-                "received reliable provisional response without RSeq"
-            );
             return Ok(None);
         };
-
         let cseq_header = resp.cseq_header()?;
         let cseq = cseq_header.seq()?;
-        let method = cseq_header.method()?;
-
+        if cseq_header.method()? != Method::Invite {
+            return Ok(None);
+        }
+        let dialog_id = DialogId::try_from((resp, TransactionRole::Client))?;
+        let local_id = self.id.lock().clone();
+        if dialog_id.call_id != local_id.call_id
+            || dialog_id.local_tag != local_id.local_tag
+            || dialog_id.remote_tag.is_empty()
         {
-            let state_guard = self.remote_reliable.lock();
-            if let Some(state) = state_guard.as_ref() {
-                if state.last_rseq == rseq {
-                    return Ok(Some(state.prack_request.clone()));
-                }
+            return Ok(None);
+        }
 
-                if state.last_rseq > rseq {
-                    return Ok(None);
-                }
+        let mut states = self.remote_reliable.lock();
+        let state = states
+            .iter_mut()
+            .find(|s| s.dialog_id == dialog_id && s.invite_cseq == cseq);
+        if let Some(state) = state.as_ref() {
+            // RFC 3262 §4: duplicates, old responses and gaps are discarded
+            // without delivering their SDP or generating another PRACK.
+            if state.last_rseq.checked_add(1) != Some(rseq) {
+                return Ok(None);
             }
+        } else if rseq > i32::MAX as u32 {
+            // The first RSeq in a transaction is in 1..=2^31-1 (§3).
+            return Ok(None);
         }
-
-        let rack_value = format!("{} {} {}", rseq, cseq, method);
-        let mut headers = vec![Header::RAck(rack_value.into())];
-        if self.supports_100rel {
-            headers.push(Header::Supported("100rel".into()));
-        }
-
-        let prack_request = self.make_request(
+        let headers = vec![Header::RAck(format!("{} {} INVITE", rseq, cseq).into())];
+        let mut prack = self.make_request(
             Method::PRack,
             Some(self.increment_local_seq()),
             None,
@@ -653,34 +708,117 @@ impl DialogInner {
             Some(headers),
             None,
         )?;
-
-        let state = RemoteReliableState {
-            last_rseq: rseq,
-            prack_request: prack_request.clone(),
-        };
-
-        {
-            let mut state_guard = self.remote_reliable.lock();
-            *state_guard = Some(state);
+        // Select the early dialog that sent this response, including forks.
+        prack
+            .headers
+            .unique_push(Header::To(resp.to_header()?.clone()));
+        if let Some(state) = state {
+            state.last_rseq = rseq;
+        } else {
+            states.push(RemoteReliableState {
+                dialog_id,
+                invite_cseq: cseq,
+                last_rseq: rseq,
+            });
         }
-
-        Ok(Some(prack_request))
+        Ok(Some(prack))
     }
 
-    pub(super) async fn handle_provisional_response(&self, resp: &Response) -> Result<()> {
-        let to_header = resp.to_header()?;
-        if let Ok(Some(tag)) = to_header.tag() {
-            self.update_remote_tag(tag.value())?;
-        }
+    /// Returns false when the provisional must be discarded, including its body.
+    pub(super) async fn handle_provisional_response(
+        self: &Arc<Self>,
+        resp: &Response,
+        request: &Request,
+    ) -> Result<bool> {
+        if resp.header_contains_token("Require", "100rel") && resp.status_code != StatusCode::Trying
+        {
+            let config = self.reliable_config.lock().clone();
+            if let Some(config) = config {
+                return self.start_reliable_prack(resp, request, config);
+            }
 
-        if let Some(prack) = self.prepare_prack_request(resp)? {
+            if request.method != Method::Invite
+                || resp.cseq_header()?.seq()? != request.cseq_header()?.seq()?
+            {
+                return Ok(false);
+            }
+            // An in-dialog response must not change the peer's tag.
+            if let Some(tag) = request.to_header()?.tag()? {
+                if resp.to_header()?.tag()?.as_ref() != Some(&tag) {
+                    return Ok(false);
+                }
+            }
+            let Some(prack) = self.prepare_prack_request(resp)? else {
+                return Ok(false);
+            };
+            if let Some(tag) = resp.to_header()?.tag()? {
+                self.update_remote_tag(tag.value())?;
+            }
             let _ = self.send_prack_request(prack).await?;
+        } else if resp.status_code != StatusCode::Trying {
+            if let Some(tag) = resp.to_header()?.tag()? {
+                self.update_remote_tag(tag.value())?;
+            }
         }
+        Ok(true)
+    }
 
-        Ok(())
+    /// Disabled dialogs reject required 100rel rather than falsely accepting it.
+    /// RFC 3262 §3 explicitly permits rejecting required 100rel with 420.
+    pub(super) async fn reject_required_100rel(&self, tx: &mut Transaction) -> Result<bool> {
+        if self.reliable_config.lock().is_some()
+            || tx.original.method != Method::Invite
+            || !tx.original.header_contains_token("Require", "100rel")
+        {
+            return Ok(false);
+        }
+        let initial =
+            self.role == TransactionRole::Server && tx.original.to_header()?.tag()?.is_none();
+        tx.reply_with(
+            StatusCode::BadExtension,
+            vec![Header::Unsupported("100rel".into())],
+            None,
+        )
+        .await?;
+        if initial {
+            let id = self.id.lock().clone();
+            self.transition(DialogState::Terminated(
+                id,
+                TerminatedReason::UasOther(StatusCode::BadExtension),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn reject_unmatched_prack(&self, tx: &mut Transaction) -> Result<()> {
+        // A syntactically valid RAck is not proof of a matching outstanding
+        // reliable response. The built-in UAS does not create any (§3).
+        let status = if crate::sip::message::rack_parts(&tx.original).is_some() {
+            StatusCode::CallTransactionDoesNotExist
+        } else {
+            StatusCode::BadRequest
+        };
+        tx.reply(status).await
     }
 
     pub(super) async fn send_prack_request(&self, request: Request) -> Result<Option<Response>> {
+        self.send_prack_request_to(request, None).await
+    }
+
+    pub(super) async fn send_prack_request_to(
+        &self,
+        request: Request,
+        destination: Option<SipAddr>,
+    ) -> Result<Option<Response>> {
+        let tx = self.start_prack_transaction(request, destination).await?;
+        self.finish_prack_transaction(tx).await
+    }
+
+    pub(super) async fn start_prack_transaction(
+        &self,
+        request: Request,
+        destination: Option<SipAddr>,
+    ) -> Result<Transaction> {
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: reuse the reliable connection recorded for
@@ -693,7 +831,9 @@ impl DialogInner {
             affinity_connection,
         );
 
-        if let Some(route) = tx.original.route_header() {
+        if destination.is_some() {
+            tx.destination = destination;
+        } else if let Some(route) = tx.original.route_header() {
             if let Ok(first_route) = route.typed() {
                 tx.destination = SipAddr::try_from(&first_route.uri).ok();
             }
@@ -722,6 +862,13 @@ impl DialogInner {
             }
         }
 
+        Ok(tx)
+    }
+
+    pub(super) async fn finish_prack_transaction(
+        &self,
+        mut tx: Transaction,
+    ) -> Result<Option<Response>> {
         let mut auth = AuthRetry::new();
         while let Some(msg) = tx.receive().await {
             match msg {
@@ -730,6 +877,9 @@ impl DialogInner {
                     StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized => {
                         let id = self.id.lock().clone();
                         if !auth.should_answer(&resp) {
+                            if self.reliable_config.lock().is_some() {
+                                return Ok(Some(resp));
+                            }
                             debug!(
                                 id = self.id.lock().to_string(),
                                 "received {} response after auth sent", resp.status_code
@@ -746,6 +896,9 @@ impl DialogInner {
                             tx.send().await?;
                             continue;
                         } else {
+                            if self.reliable_config.lock().is_some() {
+                                return Ok(Some(resp));
+                            }
                             debug!(
                                 id = self.id.lock().to_string(),
                                 "received 407 response without auth option"
@@ -885,13 +1038,22 @@ impl DialogInner {
             }
         }
 
-        Ok(crate::sip::Request {
+        let mut request = crate::sip::Request {
             method,
             uri: self.remote_uri.lock().clone(),
             headers: out.into(),
             body: body.unwrap_or_default(),
             version: crate::sip::Version::V2,
-        })
+        };
+        if method == Method::Invite {
+            if let Some(config) = self.reliable_config.lock().as_ref() {
+                super::reliable::add_option(&mut request, "Supported", "100rel");
+                if config.require {
+                    super::reliable::add_option(&mut request, "Require", "100rel");
+                }
+            }
+        }
+        Ok(request)
     }
 
     pub(super) fn make_request(
@@ -1138,7 +1300,7 @@ impl DialogInner {
         })
     }
 
-    async fn send_dialog_request(&self, request: Request) -> Result<Option<Response>> {
+    async fn send_dialog_request(self: &Arc<Self>, request: Request) -> Result<Option<Response>> {
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: deliver in-dialog requests to the remote
@@ -1287,7 +1449,12 @@ impl DialogInner {
 
                     if status.kind() == StatusCodeKind::Provisional {
                         if method == Method::Invite {
-                            self.handle_provisional_response(&resp).await?;
+                            if !self
+                                .handle_provisional_response(&resp, &tx.original)
+                                .await?
+                            {
+                                continue;
+                            }
                         }
                         // RFC 3261 §12: a dialog moves from early to confirmed
                         // and never back. A 1xx to a mid-dialog request (re-INVITE,
@@ -1349,8 +1516,8 @@ impl DialogInner {
                         method = %method,
                         "dialog do_request done: {:?}", status
                     );
-                    if !matches!(method, Method::PRack) {
-                        self.clear_remote_reliable();
+                    if method == Method::Invite {
+                        self.clear_remote_reliable(tx.original.cseq_header()?.seq()?);
                     }
                     return Ok(Some(resp));
                 }
@@ -1360,7 +1527,7 @@ impl DialogInner {
         Ok(None)
     }
 
-    pub(super) async fn do_request(&self, request: Request) -> Result<Option<Response>> {
+    pub(super) async fn do_request(self: &Arc<Self>, request: Request) -> Result<Option<Response>> {
         self.send_dialog_request(request).boxed().await
     }
 
@@ -1368,7 +1535,11 @@ impl DialogInner {
     /// once the BYE is handed to its transaction, and a 481, a 408 or no
     /// response ends the dialog. So whatever the transaction returns, the
     /// dialog is `Terminated(reason)`; a failure is still returned.
-    pub(super) async fn send_bye(&self, request: Request, reason: TerminatedReason) -> Result<()> {
+    pub(super) async fn send_bye(
+        self: &Arc<Self>,
+        request: Request,
+        reason: TerminatedReason,
+    ) -> Result<()> {
         let result = self.do_request(request).await;
         let id = self.id.lock().clone();
         self.transition(DialogState::Terminated(id, reason));
@@ -1383,7 +1554,7 @@ impl DialogInner {
     /// the extra branch. The BYE is built from that response's own remote
     /// target (Contact) and route set (Record-Route); the confirmed dialog's
     /// state is not touched and no dialog is registered for the branch.
-    pub(super) async fn bye_forked_branch(&self, resp: &Response) -> Result<()> {
+    pub(super) async fn bye_forked_branch(self: &Arc<Self>, resp: &Response) -> Result<()> {
         let contact_uri = resp
             .typed_contact_headers()?
             .first()
@@ -1440,7 +1611,11 @@ impl DialogInner {
     /// retransmitted our 2xx (`answered_2xx`) for 64*T1 and ended without an
     /// ACK. The dialog is terminated with [`TerminatedReason::Timeout`] and the
     /// session is ended with a BYE.
-    pub(super) async fn end_session_without_ack(&self, tx: &Transaction, answered_2xx: bool) {
+    pub(super) async fn end_session_without_ack(
+        self: &Arc<Self>,
+        tx: &Transaction,
+        answered_2xx: bool,
+    ) {
         if !answered_2xx
             || tx.state != crate::transaction::TransactionState::Terminated
             || self.is_terminated()
@@ -1590,7 +1765,10 @@ impl DialogInner {
             initial_request,
             session_id: Mutex::new(snapshot.session_id),
             supports_100rel: snapshot.supports_100rel,
-            remote_reliable: Mutex::new(None),
+            remote_reliable: Mutex::new(Vec::new()),
+            reliable_clients: Mutex::new(BTreeMap::new()),
+            reliable_config: Mutex::new(None),
+            reliable_servers: Mutex::new(BTreeMap::new()),
             remote_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
@@ -1739,11 +1917,75 @@ impl DialogInner {
     }
 
     #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
+    async fn process_reliable_invite_handle(
+        &self,
+        tx: &mut Transaction,
+        mut rx: TransactionCommandReceiver,
+    ) -> Result<()> {
+        use crate::platform::{select3, Which3};
+        let mut deadline =
+            core::pin::pin!(crate::platform::sleep(self.endpoint_inner.option.t1x64));
+        let mut commands_closed = false;
+        loop {
+            let selected = {
+                let command = if commands_closed {
+                    futures::future::pending().boxed()
+                } else {
+                    rx.recv().boxed()
+                };
+                let event = core::pin::pin!(tx.tu_receiver.recv());
+                select3(command, event, &mut deadline).await
+            };
+            match selected {
+                Which3::A(Some(TransactionCommand::Respond {
+                    status,
+                    headers,
+                    body,
+                })) => {
+                    let response = self.make_response(&tx.original, status, headers, body);
+                    tx.respond(response).await?;
+                }
+                Which3::A(None) => {
+                    commands_closed = true;
+                    // A final response may be waiting for SDP's PRACK.
+                    if tx
+                        .reliable_provisional
+                        .lock()
+                        .as_ref()
+                        .is_none_or(|s| !s.pending())
+                    {
+                        return tx.reply(StatusCode::NotImplemented).await;
+                    }
+                }
+                Which3::B(Some(event)) => match tx.dispatch_event(event).await {
+                    Some(Some(SipMessage::Request(req))) if req.method == Method::Cancel => {
+                        return tx.reply(StatusCode::RequestTerminated).await;
+                    }
+                    Some(None) => return Ok(()),
+                    _ => {}
+                },
+                Which3::B(None) => return Ok(()),
+                Which3::C(_) => return tx.reply(StatusCode::ServerTimeOut).await,
+            }
+            if tx
+                .last_response
+                .as_ref()
+                .is_some_and(|r| r.status_code.kind() != StatusCodeKind::Provisional)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     pub async fn process_transaction_handle(
         &self,
         tx: &mut Transaction,
         mut rx: TransactionCommandReceiver,
     ) -> Result<()> {
+        if tx.reliable_provisional.lock().is_some() {
+            return self.process_reliable_invite_handle(tx, rx).await;
+        }
         let timeout_duration = self.endpoint_inner.option.t1x64;
         let result = crate::platform::timeout(timeout_duration, async {
             while let Some(cmd) = rx.recv().await {
