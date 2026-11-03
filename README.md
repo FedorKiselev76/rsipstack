@@ -310,6 +310,37 @@ This is a simplified sketch: `User`, `users` and `incoming` are types/values you
 that holds the registered user's username and destination `SipAddr`). A complete, working proxy
 is provided in [`examples/proxy.rs`](./examples/proxy.rs).
 
+## Bridging two dialogs
+
+B2BUA applications can keep routing and call accounting outside the dialog
+layer while the stack owns SIP identities, transactions and ACK handling:
+
+- `DialogLayer::server_invite_session` drives a common initial server INVITE.
+  `branch(tag)` creates a separate early dialog for each sequential destination;
+  `respond(tag, ...)` selects the successful dialog without changing earlier tags.
+  The application must validate admission, required extensions and SDP before
+  answering. This API does not enable reliable provisional responses.
+- `create_client_invite_dialog` and `run_client_invite` let an application record
+  a leg before sending. It may call `Transaction::send` once before starting the
+  driver to distinguish a transport send from a scheduled attempt.
+- `InviteDialog::prepare_request` reserves CSeq without sending. Persist the
+  resulting snapshot, then pass the request to `send_request` or
+  `send_cancellable_request`. Use the same dialog and do not change its identity.
+- For an offerless re-INVITE, supply `InviteAnswerHandler` through
+  `send_offerless_reinvite` or `send_cancellable_request`. It receives the final
+  2xx offer and returns `AckBody`; the stack sends and caches that exact ACK for
+  retransmitted 2xx. The application owns SDP negotiation and must provide the
+  answer within the transaction timeout (64*T1).
+- Calling `TransactionHandle::cancellation` opts an incoming re-INVITE into
+  application-controlled cancellation. The stack answers CANCEL; the application
+  cancels its other leg and still supplies the INVITE final response. Without
+  this opt-in, the stack responds 487. `finished` ends the INVITE subscription.
+
+These APIs do not select suppliers, bridge media, negotiate codecs, or enable
+PRACK/100rel. Those remain separate application policy and extension decisions.
+The wire regressions in `src/dialog/tests/test_dialog_bridge.rs` cover deferred
+ACK/SDP, authenticated retries, cancellation and sequential early-dialog tags.
+
 ## Running Tests
 
 ### Unit Tests

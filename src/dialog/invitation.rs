@@ -760,6 +760,23 @@ impl DialogLayer {
         state_sender: DialogStateSender,
     ) -> Result<(InviteDialog, crate::platform::JoinHandle<InviteAsyncResult>)> {
         let (dialog, tx) = self.create_client_invite_dialog(opt, state_sender)?;
+        self.run_client_invite(dialog, tx)
+    }
+
+    /// Register and drive an INVITE prepared by create_client_invite_dialog.
+    /// The application may send its first packet before this call when it needs
+    /// to distinguish transport acceptance from merely scheduling an attempt.
+    pub fn run_client_invite(
+        self: &Arc<Self>,
+        dialog: InviteDialog,
+        tx: Transaction,
+    ) -> Result<(InviteDialog, crate::platform::JoinHandle<InviteAsyncResult>)> {
+        if dialog.role() != TransactionRole::Client || dialog.id() != DialogId::try_from(&tx)? {
+            return Err(crate::Error::Error(
+                "INVITE transaction/dialog mismatch".into(),
+            ));
+        }
+        let already_started = tx.state != crate::transaction::TransactionState::Nothing;
         let id0 = dialog.id();
 
         // 1) register early key (so in-dialog requests can be matched)
@@ -776,7 +793,7 @@ impl DialogLayer {
             dialog_layer_inner: inner.clone(),
             id: id0.clone(),
             invite_tx: Some(tx),
-            started: false,
+            started: already_started,
             dialog: Some(dialog_clone.clone()),
         };
 

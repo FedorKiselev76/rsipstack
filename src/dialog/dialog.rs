@@ -29,8 +29,95 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use futures::FutureExt;
 use tracing::{debug, info, warn};
 
+/// CANCEL belongs to the current INVITE transaction, including after an auth
+/// retry. Dropping a watch retires that attempt without dropping its response.
+struct RequestCancellation {
+    provisional: CancellationToken,
+    finished: CancellationToken,
+}
+impl Drop for RequestCancellation {
+    fn drop(&mut self) {
+        self.finished.cancel();
+    }
+}
+impl RequestCancellation {
+    fn new(tx: &Transaction, cancellation: Option<CancellationToken>) -> Self {
+        let watch = Self {
+            provisional: CancellationToken::new(),
+            finished: CancellationToken::new(),
+        };
+        if let Some(cancel) = cancellation {
+            let endpoint = tx.endpoint_inner.clone();
+            let mut request = tx.original.clone();
+            let destination = tx.destination.clone();
+            let connection = tx.connection.clone();
+            let ready = watch.provisional.clone();
+            let finished = watch.finished.clone();
+            crate::platform::spawn(async move {
+                use crate::platform::{select2, Either};
+                if matches!(
+                    select2(
+                        core::pin::pin!(cancel.cancelled()),
+                        core::pin::pin!(finished.cancelled())
+                    )
+                    .await,
+                    Either::B(_)
+                ) {
+                    return;
+                }
+                if matches!(
+                    select2(
+                        core::pin::pin!(ready.cancelled()),
+                        core::pin::pin!(finished.cancelled())
+                    )
+                    .await,
+                    Either::B(_)
+                ) {
+                    return;
+                }
+                if finished.is_cancelled() {
+                    return;
+                }
+                let result = async {
+                    request.method = Method::Cancel;
+                    request.cseq_header_mut()?.mut_method(Method::Cancel)?;
+                    request.body.clear();
+                    request.headers.retain(|h| {
+                        !matches!(h, Header::ContentType(_) | Header::ContentLength(_))
+                    });
+                    request.headers.push(Header::ContentLength(0.into()));
+                    let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
+                    let mut cancel = Transaction::new_client(key, request, endpoint, connection);
+                    cancel.destination = destination;
+                    cancel.send().await?;
+                    while cancel.receive().await.is_some() {}
+                    Ok::<_, crate::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    warn!(%error, "re-INVITE CANCEL failed");
+                }
+            });
+        }
+        watch
+    }
+}
+
 pub type TransactionCommandSender = crate::platform::BoundedSender<TransactionCommand>;
 pub type TransactionCommandReceiver = crate::platform::BoundedReceiver<TransactionCommand>;
+pub(super) struct HandleCancellation {
+    token: CancellationToken,
+    finished: CancellationToken,
+    observed: core::sync::atomic::AtomicBool,
+}
+impl core::fmt::Debug for HandleCancellation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HandleCancellation")
+            .field("cancelled", &self.token.is_cancelled())
+            .field("finished", &self.finished.is_cancelled())
+            .finish()
+    }
+}
 #[derive(Debug)]
 pub enum TransactionCommand {
     Respond {
@@ -43,12 +130,37 @@ pub enum TransactionCommand {
 #[derive(Clone, Debug)]
 pub struct TransactionHandle {
     sender: TransactionCommandSender,
+    pub(super) cancellation: Arc<HandleCancellation>,
 }
 
 impl TransactionHandle {
     pub fn new() -> (Self, TransactionCommandReceiver) {
         let (tx, rx) = mpsc::channel(4);
-        (Self { sender: tx }, rx)
+        let cancellation = Arc::new(HandleCancellation {
+            token: CancellationToken::new(),
+            finished: CancellationToken::new(),
+            observed: core::sync::atomic::AtomicBool::new(false),
+        });
+        (
+            Self {
+                sender: tx,
+                cancellation: cancellation.clone(),
+            },
+            rx,
+        )
+    }
+
+    /// Opt into application-controlled CANCEL handling for this INVITE.
+    /// The CANCEL transaction is answered by the stack. The application must
+    /// still supply the INVITE's final response (e.g. relay its other leg).
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.observed.store(true, Ordering::SeqCst);
+        self.cancellation.token.clone()
+    }
+
+    /// Completes when this INVITE's response command loop ends.
+    pub fn finished(&self) -> CancellationToken {
+        self.cancellation.finished.clone()
     }
 
     pub async fn reply(
@@ -1138,7 +1250,12 @@ impl DialogInner {
         })
     }
 
-    async fn send_dialog_request(&self, request: Request) -> Result<Option<Response>> {
+    async fn send_dialog_request(
+        self: &Arc<Self>,
+        request: Request,
+        answer: Option<Arc<dyn super::invite_dialog::InviteAnswerHandler>>,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Option<Response>> {
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: deliver in-dialog requests to the remote
@@ -1150,6 +1267,8 @@ impl DialogInner {
             self.endpoint_inner.clone(),
             affinity_connection,
         );
+
+        tx.defer_success_ack = answer.is_some();
 
         if let Some(route) = tx.original.route_header() {
             if let Ok(first_route) = route.typed() {
@@ -1272,6 +1391,8 @@ impl DialogInner {
             }
         }
 
+        let cancellation = cancellation.filter(|_| method == Method::Invite);
+        let mut cancel_watch = RequestCancellation::new(&tx, cancellation.clone());
         let mut auth = AuthRetry::new();
         while let Some(msg) = tx.receive().await {
             match msg {
@@ -1281,6 +1402,9 @@ impl DialogInner {
                     let peer_uuid = resp.session_id_header().and_then(|s| s.local_uuid());
                     self.observe_peer_session_uuid(peer_uuid);
                     let status = resp.status_code.clone();
+                    if status.kind() == StatusCodeKind::Provisional {
+                        cancel_watch.provisional.cancel();
+                    }
                     if status == StatusCode::Trying {
                         continue;
                     }
@@ -1307,6 +1431,19 @@ impl DialogInner {
                         continue;
                     }
 
+                    // A bridge has no credentials to answer the other leg's
+                    // challenge. Deliver the final response without terminating
+                    // the established dialog (RFC 3261 §14.1).
+                    if self.is_confirmed()
+                        && self.credential.is_none()
+                        && matches!(
+                            status,
+                            StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized
+                        )
+                    {
+                        return Ok(Some(resp));
+                    }
+
                     if matches!(
                         status,
                         StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized
@@ -1328,8 +1465,11 @@ impl DialogInner {
                                 crate::sip::Method::Cancel => self.get_local_seq(),
                                 _ => self.increment_local_seq(),
                             };
+                            cancel_watch.finished.cancel();
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
+                            tx.defer_success_ack = answer.is_some();
                             tx.send().await?;
+                            cancel_watch = RequestCancellation::new(&tx, cancellation.clone());
                             continue;
                         } else {
                             debug!(
@@ -1344,6 +1484,7 @@ impl DialogInner {
                         }
                     }
 
+                    cancel_watch.finished.cancel();
                     debug!(
                         id = self.id.lock().to_string(),
                         method = %method,
@@ -1351,6 +1492,31 @@ impl DialogInner {
                     );
                     if !matches!(method, Method::PRack) {
                         self.clear_remote_reliable();
+                    }
+                    if method == Method::Invite
+                        && resp.status_code.kind() == StatusCodeKind::Successful
+                    {
+                        if let Some(handler) = answer.as_ref() {
+                            let body = crate::platform::timeout(
+                                self.endpoint_inner.option.t1x64,
+                                handler.answer(resp.clone()),
+                            )
+                            .await
+                            .map_err(|_| crate::Error::Error("ACK answer timed out".into()))??;
+                            let mut ack = self.endpoint_inner.make_ack(&tx.original, &resp)?;
+                            ack.body = body.body;
+                            ack.headers
+                                .unique_push(Header::ContentType(body.content_type.into()));
+                            ack.headers
+                                .unique_push(Header::ContentLength((ack.body.len() as u32).into()));
+                            tx.last_ack = Some(ack);
+                            tx.send_ack(tx.connection.clone()).await?;
+                        }
+                        // Keep the ACK (including its SDP) available for repeated
+                        // 2xx until Timer M, rather than dropping this transaction.
+                        crate::platform::spawn(
+                            async move { while tx.receive().await.is_some() {} },
+                        );
                     }
                     return Ok(Some(resp));
                 }
@@ -1360,15 +1526,40 @@ impl DialogInner {
         Ok(None)
     }
 
-    pub(super) async fn do_request(&self, request: Request) -> Result<Option<Response>> {
-        self.send_dialog_request(request).boxed().await
+    pub(super) async fn do_request(self: &Arc<Self>, request: Request) -> Result<Option<Response>> {
+        self.send_dialog_request(request, None, None).boxed().await
+    }
+
+    pub(super) async fn do_request_with_answer(
+        self: &Arc<Self>,
+        request: Request,
+        handler: Arc<dyn super::invite_dialog::InviteAnswerHandler>,
+    ) -> Result<Option<Response>> {
+        self.send_dialog_request(request, Some(handler), None)
+            .boxed()
+            .await
+    }
+
+    pub(super) async fn do_request_cancellable(
+        self: &Arc<Self>,
+        request: Request,
+        handler: Option<Arc<dyn super::invite_dialog::InviteAnswerHandler>>,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Response>> {
+        self.send_dialog_request(request, handler, Some(cancellation))
+            .boxed()
+            .await
     }
 
     /// Send the BYE that ends this dialog. RFC 3261 §15.1.1: the session ends
     /// once the BYE is handed to its transaction, and a 481, a 408 or no
     /// response ends the dialog. So whatever the transaction returns, the
     /// dialog is `Terminated(reason)`; a failure is still returned.
-    pub(super) async fn send_bye(&self, request: Request, reason: TerminatedReason) -> Result<()> {
+    pub(super) async fn send_bye(
+        self: &Arc<Self>,
+        request: Request,
+        reason: TerminatedReason,
+    ) -> Result<()> {
         let result = self.do_request(request).await;
         let id = self.id.lock().clone();
         self.transition(DialogState::Terminated(id, reason));
@@ -1383,7 +1574,7 @@ impl DialogInner {
     /// the extra branch. The BYE is built from that response's own remote
     /// target (Contact) and route set (Record-Route); the confirmed dialog's
     /// state is not touched and no dialog is registered for the branch.
-    pub(super) async fn bye_forked_branch(&self, resp: &Response) -> Result<()> {
+    pub(super) async fn bye_forked_branch(self: &Arc<Self>, resp: &Response) -> Result<()> {
         let contact_uri = resp
             .typed_contact_headers()?
             .first()
@@ -1440,7 +1631,11 @@ impl DialogInner {
     /// retransmitted our 2xx (`answered_2xx`) for 64*T1 and ended without an
     /// ACK. The dialog is terminated with [`TerminatedReason::Timeout`] and the
     /// session is ended with a BYE.
-    pub(super) async fn end_session_without_ack(&self, tx: &Transaction, answered_2xx: bool) {
+    pub(super) async fn end_session_without_ack(
+        self: &Arc<Self>,
+        tx: &Transaction,
+        answered_2xx: bool,
+    ) {
         if !answered_2xx
             || tx.state != crate::transaction::TransactionState::Terminated
             || self.is_terminated()
@@ -1739,11 +1934,79 @@ impl DialogInner {
     }
 
     #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
+    pub(super) async fn process_invite_handle(
+        &self,
+        tx: &mut Transaction,
+        mut rx: TransactionCommandReceiver,
+        cancellation: Option<Arc<HandleCancellation>>,
+    ) -> Result<()> {
+        struct Finished(Option<Arc<HandleCancellation>>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                if let Some(c) = &self.0 {
+                    c.finished.cancel();
+                }
+            }
+        }
+        let _finished = Finished(cancellation.clone());
+        use crate::platform::{select3, Which3};
+        let mut deadline =
+            core::pin::pin!(crate::platform::sleep(self.endpoint_inner.option.t1x64));
+        loop {
+            let selected = {
+                let command = rx.recv().boxed();
+                let event = core::pin::pin!(tx.tu_receiver.recv());
+                select3(command, event, &mut deadline).await
+            };
+            match selected {
+                Which3::A(Some(TransactionCommand::Respond {
+                    status,
+                    headers,
+                    body,
+                })) => {
+                    let response = self.make_response(&tx.original, status, headers, body);
+                    tx.respond(response).await?;
+                }
+                Which3::A(None) => {
+                    return tx.reply(StatusCode::NotImplemented).await;
+                }
+                Which3::B(Some(event)) => match tx.dispatch_event(event).await {
+                    Some(Some(SipMessage::Request(req))) if req.method == Method::Cancel => {
+                        if let Some(c) = &cancellation {
+                            c.token.cancel();
+                        }
+                        if cancellation
+                            .as_ref()
+                            .is_none_or(|c| !c.observed.load(Ordering::SeqCst))
+                        {
+                            return tx.reply(StatusCode::RequestTerminated).await;
+                        }
+                    }
+                    Some(None) => return Ok(()),
+                    _ => {}
+                },
+                Which3::B(None) => return Ok(()),
+                Which3::C(_) => return tx.reply(StatusCode::ServerTimeOut).await,
+            }
+            if tx
+                .last_response
+                .as_ref()
+                .is_some_and(|r| r.status_code.kind() != StatusCodeKind::Provisional)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     pub async fn process_transaction_handle(
         &self,
         tx: &mut Transaction,
         mut rx: TransactionCommandReceiver,
     ) -> Result<()> {
+        if tx.original.method == Method::Invite {
+            return self.process_invite_handle(tx, rx, None).await;
+        }
         let timeout_duration = self.endpoint_inner.option.t1x64;
         let result = crate::platform::timeout(timeout_duration, async {
             while let Some(cmd) = rx.recv().await {

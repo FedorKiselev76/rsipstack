@@ -173,6 +173,8 @@ pub struct Transaction {
     pub connection: Option<SipConnection>,
     pub last_response: Option<Response>,
     pub last_ack: Option<Request>,
+    /// Defer the first 2xx ACK until the dialog has obtained an SDP answer.
+    pub(crate) defer_success_ack: bool,
     pub tu_receiver: TransactionEventReceiver,
     pub tu_sender: TransactionEventSender,
     pub timer_a: Option<u64>,
@@ -215,6 +217,7 @@ impl Transaction {
             state,
             last_response: None,
             last_ack: None,
+            defer_success_ack: false,
             timer_a: None,
             timer_b: None,
             timer_c: None,
@@ -798,30 +801,42 @@ impl Transaction {
     /// observes via `TransactionEvent::Terminate`.
     pub async fn receive(&mut self) -> Option<SipMessage> {
         while let Some(event) = self.tu_receiver.recv().await {
-            match event {
-                TransactionEvent::Received(msg, connection) => {
-                    if let Some(msg) = match msg {
-                        SipMessage::Request(req) => self.on_received_request(req, connection).await,
-                        SipMessage::Response(resp) => {
-                            self.on_received_response(resp, connection).await
-                        }
-                    } {
-                        return Some(msg);
-                    }
-                }
-                TransactionEvent::Timer(t) => {
-                    self.on_timer(t).await.ok();
-                }
-                TransactionEvent::Respond(response) => {
-                    self.respond(response).await.ok();
-                }
-                TransactionEvent::Terminate(key) => {
-                    debug!(%key, "received terminate event");
-                    return None;
-                }
+            if let Some(result) = self.dispatch_event(event).await {
+                return result;
             }
         }
         None
+    }
+
+    // Separating cancel-safe channel reception from non-cancel-safe dispatch
+    // lets an INVITE application command loop also drive retransmission events.
+    pub(crate) async fn dispatch_event(
+        &mut self,
+        event: TransactionEvent,
+    ) -> Option<Option<SipMessage>> {
+        match event {
+            TransactionEvent::Received(msg, connection) => {
+                let msg = match msg {
+                    SipMessage::Request(req) => self.on_received_request(req, connection).await,
+                    SipMessage::Response(resp) => self.on_received_response(resp, connection).await,
+                };
+                msg.map(Some)
+            }
+            TransactionEvent::Timer(t) => {
+                self.on_timer(t).await.ok();
+                None
+            }
+            TransactionEvent::Respond(response) => {
+                if let Err(e) = self.respond(response).await {
+                    warn!(key = %self.key, error = %e, "response rejected or could not be sent");
+                }
+                None
+            }
+            TransactionEvent::Terminate(key) => {
+                debug!(%key, "received terminate event");
+                Some(None)
+            }
+        }
     }
 
     /// Stop request retransmissions while keeping the transaction alive to
@@ -943,6 +958,18 @@ impl Transaction {
                 // `waiting_ack` must not be delivered to the TU of this
                 // transaction.
                 if req.method == Method::Ack {
+                    // A B2BUA may expose several early dialogs for one INVITE.
+                    // An ACK for a discarded early To-tag must not stop the
+                    // selected dialog's 2xx retransmissions (RFC 3261 §13.3.1.4).
+                    let expected = self
+                        .last_response
+                        .as_ref()
+                        .and_then(|r| DialogId::try_from((r, TransactionRole::Server)).ok());
+                    if expected.is_none()
+                        || DialogId::try_from((&req, TransactionRole::Server)).ok() != expected
+                    {
+                        return None;
+                    }
                     let ack_seq = req.cseq_header().and_then(|c| c.seq()).ok();
                     let invite_seq = self.original.cseq_header().and_then(|c| c.seq()).ok();
                     if ack_seq != invite_seq {
@@ -1028,7 +1055,7 @@ impl Transaction {
             }
             StatusCodeKind::Successful => {
                 if self.transaction_type == TransactionType::ClientInvite {
-                    if !self.endpoint_inner.option.auto_ack_2xx {
+                    if !self.endpoint_inner.option.auto_ack_2xx && !self.defer_success_ack {
                         // auto_ack_2xx = false (proxy mode): a 2xx terminates
                         // the client INVITE transaction at once; the ACK is
                         // the TU's job (RFC 3261 section 17.1.1.2).
@@ -1097,7 +1124,8 @@ impl Transaction {
         // absorption window is preserved.
         let auto_ack_client_invite = self.transaction_type == TransactionType::ClientInvite
             && (new_state == TransactionState::Completed
-                || new_state == TransactionState::Accepted);
+                || (new_state == TransactionState::Accepted
+                    && (!self.defer_success_ack || self.last_ack.is_some())));
 
         self.transition(new_state).ok();
 
@@ -1672,7 +1700,8 @@ impl Transaction {
                             // for a 2xx, so retransmitted 2xx fall through
                             // to the TU instead of being absorbed or re-ACKed
                             // here (RFC 3261 section 17.1.1.2).
-                            let auto_ack = self.endpoint_inner.option.auto_ack_2xx
+                            let auto_ack = (self.endpoint_inner.option.auto_ack_2xx
+                                && !self.defer_success_ack)
                                 || resp.status_code.kind() != StatusCodeKind::Successful;
                             if auto_ack {
                                 if let Ok(ack) = self.endpoint_inner.make_ack(&self.original, resp)
