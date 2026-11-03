@@ -148,7 +148,9 @@ impl ServerInviteDialog {
         self.inner
             .tu_sender
             .send(TransactionEvent::Respond(resp.clone()))?;
-        self.inner.transition(DialogState::Early(self.id(), resp));
+        if self.inner.reliable_config.lock().is_none() || !self.inner.supports_100rel {
+            self.inner.transition(DialogState::Early(self.id(), resp));
+        }
         Ok(())
     }
     /// Accept the incoming INVITE request
@@ -193,7 +195,9 @@ impl ServerInviteDialog {
             .tu_sender
             .send(TransactionEvent::Respond(resp.clone()))?;
 
-        self.inner.transition(DialogState::WaitAck(self.id(), resp));
+        if self.inner.reliable_config.lock().is_none() || !self.inner.supports_100rel {
+            self.inner.transition(DialogState::WaitAck(self.id(), resp));
+        }
         Ok(())
     }
 
@@ -653,6 +657,7 @@ impl ServerInviteDialog {
             "handle request"
         );
 
+        self.inner.attach_reliable_server(tx)?;
         if self.inner.reject_required_100rel(tx).await? {
             return Ok(());
         }
@@ -770,7 +775,7 @@ impl ServerInviteDialog {
     }
 
     async fn handle_prack(&mut self, tx: &mut Transaction) -> Result<()> {
-        self.inner.reject_unmatched_prack(tx).await
+        self.inner.receive_prack(tx).await
     }
 
     async fn handle_options(&mut self, tx: &mut Transaction) -> Result<()> {

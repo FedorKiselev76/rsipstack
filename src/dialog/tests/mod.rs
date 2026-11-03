@@ -24,3 +24,4 @@ mod test_via_listen_addr;
 mod test_warn_logs;
 
 mod test_prack_validation;
+mod test_reliable_provisional;
