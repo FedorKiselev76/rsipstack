@@ -23,4 +23,4 @@ mod test_uas_ack_timeout;
 mod test_via_listen_addr;
 mod test_warn_logs;
 
-mod test_dialog_bridge;
+mod test_reinvite_control;

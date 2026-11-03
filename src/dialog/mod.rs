@@ -14,7 +14,6 @@ pub mod invite_dialog;
 pub mod publication;
 pub mod registration;
 pub mod server_dialog;
-pub mod server_session;
 pub mod subscription;
 
 #[cfg(test)]

@@ -310,36 +310,24 @@ This is a simplified sketch: `User`, `users` and `incoming` are types/values you
 that holds the registered user's username and destination `SipAddr`). A complete, working proxy
 is provided in [`examples/proxy.rs`](./examples/proxy.rs).
 
-## Bridging two dialogs
+## Application-controlled re-INVITEs
 
-B2BUA applications can keep routing and call accounting outside the dialog
-layer while the stack owns SIP identities, transactions and ACK handling:
+For an established dialog, `prepare_reinvite(headers, body)` reserves CSeq
+without sending; an application can persist `snapshot()` before calling
+`send_reinvite(request, cancellation, answer_handler)`. The application must
+serialize offer/answer exchanges across its call legs.
 
-- `DialogLayer::server_invite_session` drives a common initial server INVITE.
-  `branch(tag)` creates a separate early dialog for each sequential destination;
-  `respond(tag, ...)` selects the successful dialog without changing earlier tags.
-  The application must validate admission, required extensions and SDP before
-  answering. This API does not enable reliable provisional responses.
-- `create_client_invite_dialog` and `run_client_invite` let an application record
-  a leg before sending. It may call `Transaction::send` once before starting the
-  driver to distinguish a transport send from a scheduled attempt.
-- `InviteDialog::prepare_request` reserves CSeq without sending. Persist the
-  resulting snapshot, then pass the request to `send_request` or
-  `send_cancellable_request`. Use the same dialog and do not change its identity.
-- For an offerless re-INVITE, supply `InviteAnswerHandler` through
-  `send_offerless_reinvite` or `send_cancellable_request`. It receives the final
-  2xx offer and returns `AckBody`; the stack sends and caches that exact ACK for
-  retransmitted 2xx. The application owns SDP negotiation and must provide the
-  answer within the transaction timeout (64*T1).
-- Calling `TransactionHandle::cancellation` opts an incoming re-INVITE into
-  application-controlled cancellation. The stack answers CANCEL; the application
-  cancels its other leg and still supplies the INVITE final response. Without
-  this opt-in, the stack responds 487. `finished` ends the INVITE subscription.
+For an offerless re-INVITE, supply an `InviteAnswerHandler` that receives the
+final 2xx offer and returns an `AckBody` within 64*T1. The stack sends that ACK
+and caches it for repeated 2xx. For an INVITE with an offer, omit the handler.
+Cancellation waits for a provisional response and follows an authenticated
+retry's transaction. A late 2xx still completes the exchange and is ACKed.
 
-These APIs do not select suppliers, bridge media, negotiate codecs, or enable
-PRACK/100rel. Those remain separate application policy and extension decisions.
-The wire regressions in `src/dialog/tests/test_dialog_bridge.rs` cover deferred
-ACK/SDP, authenticated retries, cancellation and sequential early-dialog tags.
+`DialogState::Updated` supplies a `TransactionHandle` for incoming re-INVITEs.
+Calling `handle.cancellation()` opts into application-controlled cancellation:
+the stack answers CANCEL, and the application still supplies the re-INVITE's
+final response. `handle.finished()` ends that subscription. Without opt-in,
+CANCEL produces 487. These APIs leave SDP negotiation to the application.
 
 ## Running Tests
 

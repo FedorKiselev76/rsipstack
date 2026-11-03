@@ -827,9 +827,7 @@ impl Transaction {
                 None
             }
             TransactionEvent::Respond(response) => {
-                if let Err(e) = self.respond(response).await {
-                    warn!(key = %self.key, error = %e, "response rejected or could not be sent");
-                }
+                self.respond(response).await.ok();
                 None
             }
             TransactionEvent::Terminate(key) => {
@@ -958,18 +956,6 @@ impl Transaction {
                 // `waiting_ack` must not be delivered to the TU of this
                 // transaction.
                 if req.method == Method::Ack {
-                    // A B2BUA may expose several early dialogs for one INVITE.
-                    // An ACK for a discarded early To-tag must not stop the
-                    // selected dialog's 2xx retransmissions (RFC 3261 §13.3.1.4).
-                    let expected = self
-                        .last_response
-                        .as_ref()
-                        .and_then(|r| DialogId::try_from((r, TransactionRole::Server)).ok());
-                    if expected.is_none()
-                        || DialogId::try_from((&req, TransactionRole::Server)).ok() != expected
-                    {
-                        return None;
-                    }
                     let ack_seq = req.cseq_header().and_then(|c| c.seq()).ok();
                     let invite_seq = self.original.cseq_header().and_then(|c| c.seq()).ok();
                     if ack_seq != invite_seq {

@@ -363,9 +363,7 @@ impl InviteDialog {
 
         self.inner.transition(DialogState::Calling(self.id()));
         let mut auth = AuthRetry::new();
-        if tx.state == crate::transaction::TransactionState::Nothing {
-            tx.send().await?;
-        }
+        tx.send().await?;
         // Record the flow the INVITE actually went out on, so later
         // in-dialog requests (BYE / re-INVITE / INFO) reuse it instead of
         // destination-routing off a possibly unroutable Contact.
@@ -709,81 +707,43 @@ impl InviteDialog {
         self.inner.do_request(request.clone()).await
     }
 
-    /// Reserve the next local CSeq and build a request without sending it.
-    /// Applications with durable dialog storage can persist snapshot() before
-    /// handing this request to send_request().
-    pub fn prepare_request(
+    /// Prepare a re-INVITE on a confirmed dialog, reserving its local CSeq.
+    /// Persist snapshot() before handing the request to send_reinvite().
+    /// The application must serialize offer/answer exchanges across its legs.
+    pub fn prepare_reinvite(
         &self,
-        method: Method,
         headers: Option<Vec<Header>>,
         body: Option<Vec<u8>>,
     ) -> Result<Request> {
+        if !self.inner.is_confirmed() {
+            return Err(crate::Error::Error(
+                "re-INVITE requires a confirmed dialog".into(),
+            ));
+        }
         self.inner
-            .make_request(method, None, None, None, headers, body)
+            .make_request(Method::Invite, None, None, None, headers, body)
     }
 
-    /// Send a request prepared by this dialog. Its identity is immutable.
-    pub async fn send_request(&self, request: Request) -> Result<Option<Response>> {
-        if DialogId::try_from((&request, TransactionRole::Client))? != self.id() {
-            return Err(crate::Error::Error(
-                "request does not belong to this dialog".into(),
-            ));
-        }
-        if request.method == Method::Bye {
-            self.inner
-                .send_bye(
-                    request,
-                    match self.role() {
-                        TransactionRole::Client => TerminatedReason::UacBye,
-                        TransactionRole::Server => TerminatedReason::UasBye,
-                    },
-                )
-                .await?;
-            return Ok(None);
-        }
-        self.inner.do_request(request).await
-    }
-
-    /// Send a prepared offerless re-INVITE and obtain its ACK answer from the
-    /// application. Other requests should use send_request().
-    pub async fn send_offerless_reinvite(
-        &self,
-        request: Request,
-        handler: Arc<dyn InviteAnswerHandler>,
-    ) -> Result<Option<Response>> {
-        if request.method != Method::Invite
-            || !request.body.is_empty()
-            || DialogId::try_from((&request, TransactionRole::Client))? != self.id()
-        {
-            return Err(crate::Error::Error(
-                "expected this dialog's offerless re-INVITE".into(),
-            ));
-        }
-        self.inner.do_request_with_answer(request, handler).await
-    }
-
-    /// Drive a prepared request, forwarding an INVITE cancellation without
-    /// dropping the response receiver. An ACK-answer handler is only needed
-    /// when the outgoing INVITE has no SDP offer.
-    pub async fn send_cancellable_request(
+    /// Send a prepared re-INVITE while observing cancellation without dropping
+    /// the response receiver. An offerless request requires an answer handler;
+    /// its answer is sent in ACK and cached for retransmitted 2xx.
+    /// For a request with an SDP offer, pass None as the answer handler.
+    pub async fn send_reinvite(
         &self,
         request: Request,
         cancellation: CancellationToken,
         answer: Option<Arc<dyn InviteAnswerHandler>>,
     ) -> Result<Option<Response>> {
-        if DialogId::try_from((&request, TransactionRole::Client))? != self.id()
-            || (answer.is_some() && (request.method != Method::Invite || !request.body.is_empty()))
+        if !self.inner.is_confirmed()
+            || request.method != Method::Invite
+            || DialogId::try_from((&request, TransactionRole::Client))? != self.id()
+            || request.body.is_empty() != answer.is_some()
         {
             return Err(crate::Error::Error(
-                "invalid prepared dialog request".into(),
+                "invalid prepared re-INVITE or ACK answer handler".into(),
             ));
         }
-        if request.method == Method::Bye {
-            return self.send_request(request).await;
-        }
-        self.inner
-            .do_request_cancellable(request, answer, cancellation)
-            .await
+        self.inner.do_reinvite(request, answer, cancellation).await
     }
 
     /// Send a generic in-dialog request.

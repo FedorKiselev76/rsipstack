@@ -1251,7 +1251,7 @@ impl DialogInner {
     }
 
     async fn send_dialog_request(
-        self: &Arc<Self>,
+        &self,
         request: Request,
         answer: Option<Arc<dyn super::invite_dialog::InviteAnswerHandler>>,
         cancellation: Option<CancellationToken>,
@@ -1391,8 +1391,9 @@ impl DialogInner {
             }
         }
 
-        let cancellation = cancellation.filter(|_| method == Method::Invite);
-        let mut cancel_watch = RequestCancellation::new(&tx, cancellation.clone());
+        let mut cancel_watch = cancellation
+            .clone()
+            .map(|cancel| RequestCancellation::new(&tx, Some(cancel)));
         let mut auth = AuthRetry::new();
         while let Some(msg) = tx.receive().await {
             match msg {
@@ -1403,7 +1404,9 @@ impl DialogInner {
                     self.observe_peer_session_uuid(peer_uuid);
                     let status = resp.status_code.clone();
                     if status.kind() == StatusCodeKind::Provisional {
-                        cancel_watch.provisional.cancel();
+                        if let Some(watch) = &cancel_watch {
+                            watch.provisional.cancel();
+                        }
                     }
                     if status == StatusCode::Trying {
                         continue;
@@ -1434,7 +1437,8 @@ impl DialogInner {
                     // A bridge has no credentials to answer the other leg's
                     // challenge. Deliver the final response without terminating
                     // the established dialog (RFC 3261 §14.1).
-                    if self.is_confirmed()
+                    if cancellation.is_some()
+                        && self.is_confirmed()
                         && self.credential.is_none()
                         && matches!(
                             status,
@@ -1465,11 +1469,15 @@ impl DialogInner {
                                 crate::sip::Method::Cancel => self.get_local_seq(),
                                 _ => self.increment_local_seq(),
                             };
-                            cancel_watch.finished.cancel();
+                            if let Some(watch) = &cancel_watch {
+                                watch.finished.cancel();
+                            }
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
                             tx.defer_success_ack = answer.is_some();
                             tx.send().await?;
-                            cancel_watch = RequestCancellation::new(&tx, cancellation.clone());
+                            cancel_watch = cancellation
+                                .clone()
+                                .map(|cancel| RequestCancellation::new(&tx, Some(cancel)));
                             continue;
                         } else {
                             debug!(
@@ -1484,7 +1492,9 @@ impl DialogInner {
                         }
                     }
 
-                    cancel_watch.finished.cancel();
+                    if let Some(watch) = &cancel_watch {
+                        watch.finished.cancel();
+                    }
                     debug!(
                         id = self.id.lock().to_string(),
                         method = %method,
@@ -1493,7 +1503,7 @@ impl DialogInner {
                     if !matches!(method, Method::PRack) {
                         self.clear_remote_reliable();
                     }
-                    if method == Method::Invite
+                    if cancellation.is_some()
                         && resp.status_code.kind() == StatusCodeKind::Successful
                     {
                         if let Some(handler) = answer.as_ref() {
@@ -1526,22 +1536,12 @@ impl DialogInner {
         Ok(None)
     }
 
-    pub(super) async fn do_request(self: &Arc<Self>, request: Request) -> Result<Option<Response>> {
+    pub(super) async fn do_request(&self, request: Request) -> Result<Option<Response>> {
         self.send_dialog_request(request, None, None).boxed().await
     }
 
-    pub(super) async fn do_request_with_answer(
-        self: &Arc<Self>,
-        request: Request,
-        handler: Arc<dyn super::invite_dialog::InviteAnswerHandler>,
-    ) -> Result<Option<Response>> {
-        self.send_dialog_request(request, Some(handler), None)
-            .boxed()
-            .await
-    }
-
-    pub(super) async fn do_request_cancellable(
-        self: &Arc<Self>,
+    pub(super) async fn do_reinvite(
+        &self,
         request: Request,
         handler: Option<Arc<dyn super::invite_dialog::InviteAnswerHandler>>,
         cancellation: CancellationToken,
@@ -1555,11 +1555,7 @@ impl DialogInner {
     /// once the BYE is handed to its transaction, and a 481, a 408 or no
     /// response ends the dialog. So whatever the transaction returns, the
     /// dialog is `Terminated(reason)`; a failure is still returned.
-    pub(super) async fn send_bye(
-        self: &Arc<Self>,
-        request: Request,
-        reason: TerminatedReason,
-    ) -> Result<()> {
+    pub(super) async fn send_bye(&self, request: Request, reason: TerminatedReason) -> Result<()> {
         let result = self.do_request(request).await;
         let id = self.id.lock().clone();
         self.transition(DialogState::Terminated(id, reason));
@@ -1574,7 +1570,7 @@ impl DialogInner {
     /// the extra branch. The BYE is built from that response's own remote
     /// target (Contact) and route set (Record-Route); the confirmed dialog's
     /// state is not touched and no dialog is registered for the branch.
-    pub(super) async fn bye_forked_branch(self: &Arc<Self>, resp: &Response) -> Result<()> {
+    pub(super) async fn bye_forked_branch(&self, resp: &Response) -> Result<()> {
         let contact_uri = resp
             .typed_contact_headers()?
             .first()
@@ -1631,11 +1627,7 @@ impl DialogInner {
     /// retransmitted our 2xx (`answered_2xx`) for 64*T1 and ended without an
     /// ACK. The dialog is terminated with [`TerminatedReason::Timeout`] and the
     /// session is ended with a BYE.
-    pub(super) async fn end_session_without_ack(
-        self: &Arc<Self>,
-        tx: &Transaction,
-        answered_2xx: bool,
-    ) {
+    pub(super) async fn end_session_without_ack(&self, tx: &Transaction, answered_2xx: bool) {
         if !answered_2xx
             || tx.state != crate::transaction::TransactionState::Terminated
             || self.is_terminated()
@@ -2004,9 +1996,6 @@ impl DialogInner {
         tx: &mut Transaction,
         mut rx: TransactionCommandReceiver,
     ) -> Result<()> {
-        if tx.original.method == Method::Invite {
-            return self.process_invite_handle(tx, rx, None).await;
-        }
         let timeout_duration = self.endpoint_inner.option.t1x64;
         let result = crate::platform::timeout(timeout_duration, async {
             while let Some(cmd) = rx.recv().await {
