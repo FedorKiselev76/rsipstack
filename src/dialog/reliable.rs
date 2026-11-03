@@ -321,7 +321,8 @@ impl DialogInner {
         if current.remote_tag.is_empty() || current.remote_tag == id.remote_tag {
             self.update_remote_tag(&id.remote_tag)?;
             if in_dialog.is_none() {
-                self.set_remote_target(target, None);
+                let contact = format!("<{target}>").into();
+                self.set_remote_target(target, Some(contact));
                 *self.route_set.lock() = routes;
             }
         }

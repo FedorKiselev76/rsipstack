@@ -584,6 +584,10 @@ async fn reliable_uac_offerless_invite_answers_in_prack_and_handles_required_mod
     let prack = receive_request(&c.peer, Method::PRack).await;
     assert_eq!(prack.body, ANSWER.as_bytes());
     assert_eq!(
+        crate::dialog::dialog::Dialog::Invite(c.dialog.clone()).remote_contact(),
+        Some(prack.uri.clone())
+    );
+    assert_eq!(
         prack.rack_value(),
         Some((1, c.invite.cseq_header()?.seq()?, Method::Invite))
     );
