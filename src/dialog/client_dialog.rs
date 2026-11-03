@@ -759,12 +759,20 @@ impl ClientInviteDialog {
 
                     if matches!(status.kind(), crate::sip::StatusCodeKind::Provisional) {
                         unified.send_deferred_cancel();
-                        self.inner.handle_provisional_response(&resp).await?;
+                        if !self
+                            .inner
+                            .handle_provisional_response(&resp, &tx.original)
+                            .await?
+                        {
+                            continue;
+                        }
                         self.inner.transition(DialogState::Early(self.id(), resp));
                         unified.send_deferred_cancel();
                         continue;
                     }
 
+                    self.inner
+                        .clear_remote_reliable(tx.original.cseq_header()?.seq()?);
                     if matches!(
                         status,
                         StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized

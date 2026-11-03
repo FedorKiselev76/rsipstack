@@ -1079,6 +1079,12 @@ impl Transaction {
                 if last.status_code == resp.status_code
                     && last.body == resp.body
                     && last.rseq_value() == resp.rseq_value()
+                    && last.cseq_header().ok() == resp.cseq_header().ok()
+                    && last.call_id_header().ok() == resp.call_id_header().ok()
+                    && last.from_header().and_then(|h| h.tag()).ok()
+                        == resp.from_header().and_then(|h| h.tag()).ok()
+                    && last.to_header().and_then(|h| h.tag()).ok()
+                        == resp.to_header().and_then(|h| h.tag()).ok()
                 {
                     // ignore duplicate response
                     return None;

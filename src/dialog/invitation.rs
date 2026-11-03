@@ -147,6 +147,9 @@ pub struct InviteOption {
     /// `Content-Type` here replaces the one the stack would add, so it is
     /// never sent twice; a `Content-Type` here wins over `content_type`.
     pub headers: Option<Vec<crate::sip::Header>>,
+    /// Advertise client-side PRACK support. Disabled by default. This does not
+    /// enable reliable provisional responses on the built-in UAS. Applications
+    /// requiring offer/answer in PRACK need additional SDP integration.
     pub support_prack: bool,
     pub call_id: Option<String>,
     /// RFC 7989: local Session-ID UUID for this call (32 hex chars; dashed

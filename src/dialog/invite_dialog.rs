@@ -363,13 +363,21 @@ impl InviteDialog {
                         // Not held back by a PRACK (RFC 3262); again after
                         // the transition for a cancel() racing this one.
                         self.send_deferred_cancel();
-                        self.inner.handle_provisional_response(&resp).await?;
+                        if !self
+                            .inner
+                            .handle_provisional_response(&resp, &tx.original)
+                            .await?
+                        {
+                            continue;
+                        }
                         self.inner.transition(DialogState::Early(self.id(), resp));
                         self.send_deferred_cancel();
                         continue;
                     }
 
                     // A challenge to a cancelled INVITE is its final response.
+                    self.inner
+                        .clear_remote_reliable(tx.original.cseq_header()?.seq()?);
                     if matches!(
                         status,
                         StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized
@@ -780,6 +788,10 @@ impl InviteDialog {
             self.inner.observe_peer_session_uuid(peer_uuid);
         }
 
+        if self.inner.reject_required_100rel(tx).await? {
+            return Ok(());
+        }
+
         let cseq = tx.original.cseq_header()?.seq()?;
         let remote_seq = self.inner.remote_seq.load(Ordering::Relaxed);
         if remote_seq > 0 && cseq < remote_seq {
@@ -922,29 +934,7 @@ impl InviteDialog {
     }
 
     async fn handle_prack(&mut self, tx: &mut Transaction) -> Result<()> {
-        debug!(id = %self.id(), uri = %tx.original.uri, "received prack");
-
-        let rack_ok = tx.original.rack_value().is_some()
-            || tx
-                .original
-                .header_value("RAck")
-                .and_then(|value| {
-                    let mut items = value.split_whitespace();
-                    let rseq = items.next()?.parse::<u32>().ok()?;
-                    let cseq = items.next()?.parse::<u32>().ok()?;
-                    let method = items.next()?.parse::<Method>().ok()?;
-                    Some((rseq, cseq, method))
-                })
-                .is_some();
-
-        if !rack_ok {
-            warn!(id = %self.id(), "received PRACK without RAck header");
-            tx.reply(StatusCode::BadRequest).await?;
-            return Ok(());
-        }
-
-        tx.reply(StatusCode::OK).await?;
-        Ok(())
+        self.inner.reject_unmatched_prack(tx).await
     }
 
     async fn handle_options(&mut self, tx: &mut Transaction) -> Result<()> {
