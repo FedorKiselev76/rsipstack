@@ -36,6 +36,29 @@ fn glare_backoff_ms() -> u64 {
     2100 + (x % 1900)
 }
 
+/// Body supplied by the application for an INVITE's 2xx ACK.
+#[derive(Clone, Debug)]
+pub struct AckBody {
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+impl AckBody {
+    pub fn sdp(body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            content_type: "application/sdp".into(),
+            body: body.into(),
+        }
+    }
+}
+
+/// Application callback for a 2xx offer to an offerless re-INVITE. The returned
+/// body is the answer carried by ACK (RFC 3261 §13.2.2.4). Implementations must
+/// return promptly; the dialog applies its transaction timeout.
+#[async_trait::async_trait]
+pub trait InviteAnswerHandler: Send + Sync {
+    async fn answer(&self, response: Response) -> Result<AckBody>;
+}
+
 /// Unified INVITE dialog that can act as either a UAS (Server) or UAC (Client).
 ///
 /// Role-specific methods (e.g. `ringing`/`accept`/`reject` for UAS, or
@@ -685,6 +708,45 @@ impl InviteDialog {
         self.inner.do_request(request.clone()).await
     }
 
+    /// Prepare a re-INVITE on a confirmed dialog, reserving its local CSeq.
+    /// Persist snapshot() before handing the request to send_reinvite().
+    /// The application must serialize offer/answer exchanges across its legs.
+    pub fn prepare_reinvite(
+        &self,
+        headers: Option<Vec<Header>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<Request> {
+        if !self.inner.is_confirmed() {
+            return Err(crate::Error::Error(
+                "re-INVITE requires a confirmed dialog".into(),
+            ));
+        }
+        self.inner
+            .make_request(Method::Invite, None, None, None, headers, body)
+    }
+
+    /// Send a prepared re-INVITE while observing cancellation without dropping
+    /// the response receiver. An offerless request requires an answer handler;
+    /// its answer is sent in ACK and cached for retransmitted 2xx.
+    /// For a request with an SDP offer, pass None as the answer handler.
+    pub async fn send_reinvite(
+        &self,
+        request: Request,
+        cancellation: CancellationToken,
+        answer: Option<Arc<dyn InviteAnswerHandler>>,
+    ) -> Result<Option<Response>> {
+        if !self.inner.is_confirmed()
+            || request.method != Method::Invite
+            || DialogId::try_from((&request, TransactionRole::Client))? != self.id()
+            || request.body.is_empty() != answer.is_some()
+        {
+            return Err(crate::Error::Error(
+                "invalid prepared re-INVITE or ACK answer handler".into(),
+            ));
+        }
+        self.inner.do_reinvite(request, answer, cancellation).await
+    }
+
     /// Send a generic in-dialog request.
     pub async fn request(
         &self,
@@ -1015,10 +1077,13 @@ impl InviteDialog {
     async fn handle_reinvite(&mut self, tx: &mut Transaction) -> Result<()> {
         debug!(id = %self.id(), "received re-invite {}", tx.original.uri);
         let (handle, rx) = TransactionHandle::new();
+        let cancellation = handle.cancellation.clone();
         self.inner
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle));
 
-        self.inner.process_transaction_handle(tx, rx).await?;
+        self.inner
+            .process_invite_handle(tx, rx, Some(cancellation))
+            .await?;
         let answered_2xx = tx
             .last_response
             .as_ref()

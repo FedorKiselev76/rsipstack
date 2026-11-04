@@ -173,6 +173,8 @@ pub struct Transaction {
     pub connection: Option<SipConnection>,
     pub last_response: Option<Response>,
     pub last_ack: Option<Request>,
+    /// Defer the first 2xx ACK until the dialog has obtained an SDP answer.
+    pub(crate) defer_success_ack: bool,
     pub tu_receiver: TransactionEventReceiver,
     pub tu_sender: TransactionEventSender,
     pub timer_a: Option<u64>,
@@ -215,6 +217,7 @@ impl Transaction {
             state,
             last_response: None,
             last_ack: None,
+            defer_success_ack: false,
             timer_a: None,
             timer_b: None,
             timer_c: None,
@@ -810,30 +813,40 @@ impl Transaction {
     /// observes via `TransactionEvent::Terminate`.
     pub async fn receive(&mut self) -> Option<SipMessage> {
         while let Some(event) = self.tu_receiver.recv().await {
-            match event {
-                TransactionEvent::Received(msg, connection) => {
-                    if let Some(msg) = match msg {
-                        SipMessage::Request(req) => self.on_received_request(req, connection).await,
-                        SipMessage::Response(resp) => {
-                            self.on_received_response(resp, connection).await
-                        }
-                    } {
-                        return Some(msg);
-                    }
-                }
-                TransactionEvent::Timer(t) => {
-                    self.on_timer(t).await.ok();
-                }
-                TransactionEvent::Respond(response) => {
-                    self.respond(response).await.ok();
-                }
-                TransactionEvent::Terminate(key) => {
-                    debug!(%key, "received terminate event");
-                    return None;
-                }
+            if let Some(result) = self.dispatch_event(event).await {
+                return result;
             }
         }
         None
+    }
+
+    // Separating cancel-safe channel reception from non-cancel-safe dispatch
+    // lets an INVITE application command loop also drive retransmission events.
+    pub(crate) async fn dispatch_event(
+        &mut self,
+        event: TransactionEvent,
+    ) -> Option<Option<SipMessage>> {
+        match event {
+            TransactionEvent::Received(msg, connection) => {
+                let msg = match msg {
+                    SipMessage::Request(req) => self.on_received_request(req, connection).await,
+                    SipMessage::Response(resp) => self.on_received_response(resp, connection).await,
+                };
+                msg.map(Some)
+            }
+            TransactionEvent::Timer(t) => {
+                self.on_timer(t).await.ok();
+                None
+            }
+            TransactionEvent::Respond(response) => {
+                self.respond(response).await.ok();
+                None
+            }
+            TransactionEvent::Terminate(key) => {
+                debug!(%key, "received terminate event");
+                Some(None)
+            }
+        }
     }
 
     /// Stop request retransmissions while keeping the transaction alive to
@@ -1096,7 +1109,7 @@ impl Transaction {
             }
             StatusCodeKind::Successful => {
                 if self.transaction_type == TransactionType::ClientInvite {
-                    if !self.endpoint_inner.option.auto_ack_2xx {
+                    if !self.endpoint_inner.option.auto_ack_2xx && !self.defer_success_ack {
                         // auto_ack_2xx = false (proxy mode): a 2xx terminates
                         // the client INVITE transaction at once; the ACK is
                         // the TU's job (RFC 3261 section 17.1.1.2).
@@ -1165,7 +1178,8 @@ impl Transaction {
         // absorption window is preserved.
         let auto_ack_client_invite = self.transaction_type == TransactionType::ClientInvite
             && (new_state == TransactionState::Completed
-                || new_state == TransactionState::Accepted);
+                || (new_state == TransactionState::Accepted
+                    && (!self.defer_success_ack || self.last_ack.is_some())));
 
         self.transition(new_state).ok();
 
@@ -1740,7 +1754,8 @@ impl Transaction {
                             // for a 2xx, so retransmitted 2xx fall through
                             // to the TU instead of being absorbed or re-ACKed
                             // here (RFC 3261 section 17.1.1.2).
-                            let auto_ack = self.endpoint_inner.option.auto_ack_2xx
+                            let auto_ack = (self.endpoint_inner.option.auto_ack_2xx
+                                && !self.defer_success_ack)
                                 || resp.status_code.kind() != StatusCodeKind::Successful;
                             if auto_ack {
                                 if let Ok(ack) = self.endpoint_inner.make_ack(&self.original, resp)

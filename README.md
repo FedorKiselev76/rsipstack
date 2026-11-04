@@ -331,6 +331,25 @@ This is a simplified sketch: `User`, `users` and `incoming` are types/values you
 that holds the registered user's username and destination `SipAddr`). A complete, working proxy
 is provided in [`examples/proxy.rs`](./examples/proxy.rs).
 
+## Application-controlled re-INVITEs
+
+For an established dialog, `prepare_reinvite(headers, body)` reserves CSeq
+without sending; an application can persist `snapshot()` before calling
+`send_reinvite(request, cancellation, answer_handler)`. The application must
+serialize offer/answer exchanges across its call legs.
+
+For an offerless re-INVITE, supply an `InviteAnswerHandler` that receives the
+final 2xx offer and returns an `AckBody` within 64*T1. The stack sends that ACK
+and caches it for repeated 2xx. For an INVITE with an offer, omit the handler.
+Cancellation waits for a provisional response and follows an authenticated
+retry's transaction. A late 2xx still completes the exchange and is ACKed.
+
+`DialogState::Updated` supplies a `TransactionHandle` for incoming re-INVITEs.
+Calling `handle.cancellation()` opts into application-controlled cancellation:
+the stack answers CANCEL, and the application still supplies the re-INVITE's
+final response. `handle.finished()` ends that subscription. Without opt-in,
+CANCEL produces 487. These APIs leave SDP negotiation to the application.
+
 ## Running Tests
 
 ### Unit Tests

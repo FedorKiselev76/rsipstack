@@ -667,10 +667,13 @@ impl ClientInviteDialog {
     async fn handle_reinvite(&mut self, tx: &mut Transaction) -> Result<()> {
         debug!(id = %self.id(), uri = %tx.original.uri, "received reinvite");
         let (handle, rx) = TransactionHandle::new();
+        let cancellation = handle.cancellation.clone();
         self.inner
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle));
 
-        self.inner.process_transaction_handle(tx, rx).await?;
+        self.inner
+            .process_invite_handle(tx, rx, Some(cancellation))
+            .await?;
         let answered_2xx = tx
             .last_response
             .as_ref()
