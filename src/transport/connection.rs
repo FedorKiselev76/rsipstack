@@ -340,6 +340,7 @@ impl SipConnection {
         }
     }
     pub async fn serve_loop(&self, sender: TransportSender, idle_timeout: Duration) -> Result<()> {
+        let _ = idle_timeout;
         match self {
             SipConnection::Channel(transport) => transport.serve_loop(sender).await,
             SipConnection::Udp(transport) => transport.serve_loop(sender).await,
@@ -504,14 +505,12 @@ impl SipConnection {
                 typed_via.params.push(Param::Transport(transport));
             }
 
-            let received_str = match addr {
-                SocketAddr::V6(_) => format!("[{}]", received.host),
-                _ => received.host.to_string(),
-            };
+            // RFC 3261 §20.42: `received` is a bare address, also for IPv6
+            // (no brackets; `Host`'s Display would add them).
             typed_via
                 .params
                 .push(Param::Received(crate::sip::param::Received::new(
-                    received_str,
+                    addr.ip().to_string(),
                 )));
             typed_via.params.push(Param::Rport(Some(addr.port())));
             Ok(typed_via.into())
