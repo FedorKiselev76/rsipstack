@@ -13,6 +13,7 @@ use tokio::process::{Child, Command};
 mod bridge;
 mod extended;
 mod faults;
+mod prack_sdp;
 mod prack_uas;
 mod registration;
 mod subscription;
@@ -69,8 +70,9 @@ impl Sipp {
             scenario,
             "duplicate_200"
                 | "prack_lost_response"
-                | "application_lost_bye_response"
+                | "prack_uas_retransmit"
                 | "bridge_offerless_peer"
+                | "application_lost_bye_response"
         ) {
             vec!["-nr"]
         } else {
