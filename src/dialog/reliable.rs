@@ -162,6 +162,14 @@ pub(super) struct ReliableClient {
 }
 
 impl DialogInner {
+    pub(super) fn has_reliable_sdp(&self, cseq: u32) -> bool {
+        let id = self.id.lock().clone();
+        self.reliable_clients
+            .lock()
+            .get(&(id, cseq))
+            .is_some_and(|c| c.first_sdp.is_some())
+    }
+
     #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     pub(super) fn start_reliable_prack(
         self: &Arc<Self>,

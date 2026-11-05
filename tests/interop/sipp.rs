@@ -10,6 +10,7 @@ use std::{
     process::Stdio,
 };
 use tokio::process::{Child, Command};
+mod bridge;
 mod extended;
 mod faults;
 mod prack_sdp;
@@ -67,7 +68,10 @@ impl Sipp {
         // duplicate detector would otherwise consume it before the XML step.
         let duplicate_flags = if matches!(
             scenario,
-            "duplicate_200" | "prack_lost_response" | "prack_uas_retransmit"
+            "duplicate_200"
+                | "prack_lost_response"
+                | "prack_uas_retransmit"
+                | "bridge_offerless_peer"
         ) {
             vec!["-nr"]
         } else {

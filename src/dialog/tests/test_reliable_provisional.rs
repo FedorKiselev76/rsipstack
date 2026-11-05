@@ -607,6 +607,13 @@ async fn reliable_uac_offerless_invite_answers_in_prack_and_handles_required_mod
 
 #[tokio::test]
 async fn reliable_reinvite_prack_preserves_or_refreshes_target_from_contact() -> Result<()> {
+    reinvite_prack_target(false).await
+}
+#[tokio::test]
+async fn controlled_reinvite_prack_preserves_or_refreshes_target_from_contact() -> Result<()> {
+    reinvite_prack_target(true).await
+}
+async fn reinvite_prack_target(controlled: bool) -> Result<()> {
     let mut c = Client::new(true, false, false).await?;
     c.send(reply(
         &c.invite,
@@ -625,12 +632,14 @@ async fn reliable_reinvite_prack_preserves_or_refreshes_target_from_contact() ->
     let target = dialog.inner.remote_uri.lock().clone();
     let sender = dialog.clone();
     let reinvite_task = tokio::spawn(async move {
-        sender
-            .reinvite(
-                Some(vec![Header::ContentType("application/sdp".into())]),
-                Some(OFFER.as_bytes().to_vec()),
-            )
-            .await
+        let headers = Some(vec![Header::ContentType("application/sdp".into())]);
+        let body = Some(OFFER.as_bytes().to_vec());
+        if controlled {
+            let request = sender.prepare_reinvite(headers, body)?;
+            sender.send_reinvite(request, Default::default()).await
+        } else {
+            sender.reinvite(headers, body).await
+        }
     });
     let reinvite = receive_request(&c.peer, Method::Invite).await;
     assert!(reinvite.header_contains_token("Supported", "100rel"));
@@ -1166,5 +1175,153 @@ async fn reliable_reinvite_returns_after_consuming_transaction_termination() -> 
         .await
         .expect("re-INVITE handler must finish")?;
     assert!(matches!(s.events.try_recv(), Ok(DialogState::Updated(..))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn controlled_offerless_reinvite_uses_prack_answer_and_empty_ack() -> Result<()> {
+    use crate::dialog::reinvite::{AckBody, InviteAnswerHandler, ReinviteOptions};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    struct FinalAnswer(AtomicUsize);
+    #[async_trait]
+    impl InviteAnswerHandler for FinalAnswer {
+        async fn answer(&self, _: Response) -> Result<AckBody> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(AckBody::sdp(ANSWER))
+        }
+        fn fallback_answer(&self, _: &Response) -> AckBody {
+            AckBody::sdp(ANSWER)
+        }
+    }
+    let mut c = Client::new(true, false, false).await?;
+    c.send(reply(
+        &c.invite,
+        StatusCode::OK,
+        "bob",
+        c.peer.local_addr()?,
+        None,
+        Some(ANSWER),
+    ))
+    .await;
+    timeout(Duration::from_secs(1), &mut c.call)
+        .await
+        .unwrap()
+        .unwrap()?;
+    receive_request(&c.peer, Method::Ack).await;
+    let final_answer = Arc::new(FinalAnswer(AtomicUsize::new(0)));
+    let options = ReinviteOptions {
+        answer_handler: Some(final_answer.clone()),
+        ..Default::default()
+    };
+    let dialog = c.dialog.clone();
+    let request = dialog.prepare_reinvite(None, None)?;
+    let task = tokio::spawn(async move { dialog.send_reinvite(request, options).await });
+    let invite = receive_request(&c.peer, Method::Invite).await;
+    c.send(reply(
+        &invite,
+        StatusCode::SessionProgress,
+        "bob",
+        c.peer.local_addr()?,
+        Some(1),
+        Some(OFFER),
+    ))
+    .await;
+    let prack = receive_request(&c.peer, Method::PRack).await;
+    assert_eq!(prack.body, ANSWER.as_bytes());
+    c.acknowledge(&prack, None).await;
+    let final_response = reply(
+        &invite,
+        StatusCode::OK,
+        "bob",
+        c.peer.local_addr()?,
+        None,
+        Some(OFFER),
+    );
+    c.send(final_response.clone()).await;
+    let ack = receive_request(&c.peer, Method::Ack).await;
+    assert!(ack.body.is_empty());
+    assert_eq!(final_answer.0.load(Ordering::SeqCst), 0);
+    timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()?;
+    c.send(final_response).await;
+    assert_eq!(receive_request(&c.peer, Method::Ack).await, ack);
+    Ok(())
+}
+
+#[tokio::test]
+async fn controlled_incoming_reinvite_drives_prack_with_closed_command_channel() -> Result<()> {
+    use crate::transaction::transaction::TransactionEvent;
+    let mut s = Server::new(true).await?;
+    *s.dialog.inner.state.lock() = DialogState::Confirmed(s.dialog.id(), Response::default());
+    let mut request = s.tx.original.clone();
+    request
+        .to_header_mut()?
+        .mut_tag(s.dialog.id().local_tag.into())?;
+    request.headers.unique_push(Header::CSeq("3 INVITE".into()));
+    request.headers.unique_push(Header::Via(
+        "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-controlled-reliable".into(),
+    ));
+    let key = TransactionKey::from_request(&request, TransactionRole::Server)?;
+    s.tx = Transaction::new_server(
+        key,
+        request.clone(),
+        s.endpoint.inner.clone(),
+        Some(s.conn.clone()),
+    );
+    s.dialog.inner.attach_reliable_server(&s.tx)?;
+    let sender = s.tx.tu_sender.clone();
+    let inner = s.dialog.inner.clone();
+    let task = tokio::spawn(async move { inner.process_reinvite(&mut s.tx, true).await });
+    let Some(DialogState::Updated(_, _, handle)) = s.events.recv().await else {
+        panic!("missing re-INVITE event")
+    };
+    handle
+        .respond(
+            StatusCode::SessionProgress,
+            Some(vec![Header::ContentType("application/sdp".into())]),
+            Some(ANSWER.as_bytes().to_vec()),
+        )
+        .await?;
+    handle.respond(StatusCode::OK, None, None).await?;
+    drop(handle);
+    let Some(TransportEvent::Incoming(SipMessage::Response(first), _, _)) = s.outgoing.recv().await
+    else {
+        panic!("missing 183")
+    };
+    assert_eq!(first.status_code, StatusCode::SessionProgress);
+    let mut prack = request.clone();
+    prack.method = Method::PRack;
+    prack.headers.unique_push(Header::CSeq("4 PRACK".into()));
+    prack.headers.unique_push(Header::RAck(
+        format!("{} 3 INVITE", first.rseq_value().unwrap()).into(),
+    ));
+    prack.headers.unique_push(Header::Via(
+        "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-controlled-prack".into(),
+    ));
+    prack.body.clear();
+    let key = TransactionKey::from_request(&prack, TransactionRole::Server)?;
+    let mut prack =
+        Transaction::new_server(key, prack, s.endpoint.inner.clone(), Some(s.conn.clone()));
+    s.dialog.inner.receive_prack(&mut prack).await?;
+    // First 200 is PRACK, second is the previously queued INVITE final.
+    s.outgoing.recv().await.unwrap();
+    let Some(TransportEvent::Incoming(SipMessage::Response(final_response), _, _)) =
+        s.outgoing.recv().await
+    else {
+        panic!("missing INVITE final")
+    };
+    assert_eq!(final_response.cseq_header()?.method()?, Method::Invite);
+    assert_eq!(final_response.status_code, StatusCode::OK);
+    let ack = s.endpoint.inner.make_ack(&request, &final_response)?;
+    sender.send(TransactionEvent::Received(
+        SipMessage::Request(ack),
+        Some(s.conn),
+    ))?;
+    timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()?;
     Ok(())
 }

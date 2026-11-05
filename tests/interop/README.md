@@ -31,7 +31,17 @@ bash scripts/interop/run.sh faults                    # 26 UDP loss/delay/race c
 bash scripts/interop/run.sh known-gaps                # reproduce documented failures
 bash scripts/interop/run.sh pjsip udp_uac_peer_bye     # one test
 bash scripts/interop/run.sh sipp wrong_tag_bye         # UDP and TCP
+bash scripts/interop/run.sh pjsip bridge               # two-peer hold/resume bridge
+bash scripts/interop/run.sh sipp bridge                # offerless bridge and lost SDP ACK
 ```
+
+The bridge cases use two independent peer processes and two rsipstack dialog
+legs joined by the public `ReinviteBridge` component. Four PJSUA cases cover
+hold/resume initiated from either leg over UDP/TCP. Five SIPp cases cover
+offerless re-INVITEs in both directions, delayed answers supplied in ACK,
+identical ACK retransmission, and loss of the first SDP-bearing ACK over UDP.
+Each leg has a separate trace directory; both must finish without background
+errors or live dialogs. These tests do not assert RTP delivery or PRACK bridging.
 
 The **first explicit harness run** downloads and builds the selected peers in
 `target/interop`. Later runs reuse them. Normal `cargo build` and `cargo test`

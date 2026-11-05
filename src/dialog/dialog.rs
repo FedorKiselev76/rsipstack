@@ -44,12 +44,19 @@ pub enum TransactionCommand {
 #[derive(Clone, Debug)]
 pub struct TransactionHandle {
     sender: TransactionCommandSender,
+    pub(super) control: Arc<super::reinvite::HandleControl>,
 }
 
 impl TransactionHandle {
     pub fn new() -> (Self, TransactionCommandReceiver) {
         let (tx, rx) = mpsc::channel(4);
-        (Self { sender: tx }, rx)
+        (
+            Self {
+                sender: tx,
+                control: Arc::default(),
+            },
+            rx,
+        )
     }
 
     pub async fn reply(
@@ -359,7 +366,8 @@ pub struct DialogInner {
     pub(super) cancel_requested: AtomicBool,
     /// That CANCEL waits for a provisional response (RFC 3261 §9.1).
     pub(super) cancel_deferred: AtomicBool,
-    pub(super) initial_ack: Mutex<Option<Arc<InitialInviteAck>>>,
+    pub(super) initial_ack: Mutex<Option<Arc<InviteAck>>>,
+    pub(super) reinvite_ack: Mutex<Option<Arc<InviteAck>>>,
 }
 
 pub type DialogStateReceiver = UnboundedReceiver<DialogState>;
@@ -367,13 +375,13 @@ pub type DialogStateSender = UnboundedSender<DialogState>;
 
 pub(super) type DialogInnerRef = Arc<DialogInner>;
 
-/// Outgoing teardown waits for the initial ACK attempt; incoming BYE does not.
-pub(super) struct InitialInviteAck {
+/// Outgoing teardown waits for an ACK attempt; incoming BYE does not.
+pub(super) struct InviteAck {
     pub done: CancellationToken,
     completed: AtomicBool,
 }
 
-impl InitialInviteAck {
+impl InviteAck {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             done: CancellationToken::new(),
@@ -549,6 +557,7 @@ impl DialogInner {
             cancel_requested: AtomicBool::new(false),
             cancel_deferred: AtomicBool::new(false),
             initial_ack: Mutex::new(None),
+            reinvite_ack: Mutex::new(None),
         })
     }
     /// Extract RFC 7989 Session-ID state from the initial request.
@@ -1401,7 +1410,11 @@ impl DialogInner {
         })
     }
 
-    async fn send_dialog_request(self: &Arc<Self>, request: Request) -> Result<Option<Response>> {
+    async fn send_dialog_request(
+        self: &Arc<Self>,
+        request: Request,
+        options: Option<super::reinvite::ReinviteOptions>,
+    ) -> Result<Option<Response>> {
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: deliver in-dialog requests to the remote
@@ -1413,6 +1426,8 @@ impl DialogInner {
             self.endpoint_inner.clone(),
             affinity_connection,
         );
+        tx.defer_success_ack = options.as_ref().is_some_and(|o| o.answer_handler.is_some());
+        tx.force_success_ack = options.is_some() && !tx.defer_success_ack;
         self.reserve_invite(&tx)?;
 
         if let Some(route) = tx.original.route_header() {
@@ -1536,6 +1551,9 @@ impl DialogInner {
             }
         }
 
+        let mut cancel_watch = options
+            .as_ref()
+            .map(|o| super::reinvite::RequestCancellation::new(&tx, Some(o.cancellation.clone())));
         let mut auth = AuthRetry::new();
         while let Some(msg) = tx.receive().await {
             match msg {
@@ -1545,6 +1563,13 @@ impl DialogInner {
                     let peer_uuid = resp.session_id_header().and_then(|s| s.local_uuid());
                     self.observe_peer_session_uuid(peer_uuid);
                     let status = resp.status_code.clone();
+                    if let Some(watch) = &cancel_watch {
+                        if status.kind() == StatusCodeKind::Provisional {
+                            watch.provisional.cancel();
+                        } else {
+                            watch.finished.cancel();
+                        }
+                    }
                     if status == StatusCode::Trying {
                         continue;
                     }
@@ -1569,6 +1594,12 @@ impl DialogInner {
                                 continue;
                             }
                         }
+                        if let Some(sender) = options
+                            .as_ref()
+                            .and_then(|o| o.provisional_responses.as_ref())
+                        {
+                            sender.send(resp.clone()).ok();
+                        }
                         // RFC 3261 §12: a dialog moves from early to confirmed
                         // and never back. A 1xx to a mid-dialog request (re-INVITE,
                         // UPDATE, ...) must not regress an established dialog to
@@ -1590,7 +1621,10 @@ impl DialogInner {
                     if matches!(
                         status,
                         StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized
-                    ) {
+                    ) && !options
+                        .as_ref()
+                        .is_some_and(|o| o.cancellation.is_cancelled())
+                    {
                         let id = self.id.lock().clone();
                         if !auth.should_answer(&resp) {
                             debug!(
@@ -1617,8 +1651,17 @@ impl DialogInner {
                                 _ => self.increment_local_seq(),
                             };
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
+                            tx.defer_success_ack =
+                                options.as_ref().is_some_and(|o| o.answer_handler.is_some());
+                            tx.force_success_ack = options.is_some() && !tx.defer_success_ack;
                             self.reserve_invite(&tx)?;
                             tx.send().await?;
+                            cancel_watch = options.as_ref().map(|o| {
+                                super::reinvite::RequestCancellation::new(
+                                    &tx,
+                                    Some(o.cancellation.clone()),
+                                )
+                            });
                             continue;
                         } else {
                             debug!(
@@ -1652,8 +1695,65 @@ impl DialogInner {
                     {
                         self.refresh_target_from_response(&resp)?;
                     }
+                    let reliable_sdp = method == Method::Invite
+                        && self.has_reliable_sdp(tx.original.cseq_header()?.seq()?);
                     if method == Method::Invite {
                         self.clear_remote_reliable(tx.original.cseq_header()?.seq()?);
+                    }
+                    if let Some(options) = &options {
+                        if status.kind() == StatusCodeKind::Successful {
+                            let gate = options.answer_handler.as_ref().map(|_| {
+                                let gate = InviteAck::new();
+                                self.reinvite_ack.lock().replace(gate.clone());
+                                super::reinvite::AckGuard(gate)
+                            });
+                            let answer = if let Some(handler) = &options.answer_handler {
+                                if reliable_sdp {
+                                    // The offer was answered in PRACK. The final
+                                    // response repeats it; ACK must not negotiate again.
+                                    tx.last_ack =
+                                        Some(self.endpoint_inner.make_ack(&tx.original, &resp)?);
+                                    tx.send_ack(tx.connection.clone()).await
+                                } else {
+                                    self.answer_reinvite(&mut tx, &resp, handler).await
+                                }
+                            } else {
+                                Ok(())
+                            };
+                            // Keep the exact ACK (including SDP) until Timer M,
+                            // including a rejecting answer followed by BYE.
+                            crate::platform::spawn(
+                                async move { while tx.receive().await.is_some() {} },
+                            );
+                            if let Err(error) = answer {
+                                if !self.is_terminated() {
+                                    let bye = self.make_request(
+                                        Method::Bye,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                    self.transition(DialogState::Terminated(
+                                        self.id.lock().clone(),
+                                        TerminatedReason::UacOther(StatusCode::NotAcceptableHere),
+                                    ));
+                                    if let Some(gate) = &gate {
+                                        gate.0.finish();
+                                    }
+                                    if let Ok(bye) = bye {
+                                        self.do_request(bye).await.ok();
+                                    }
+                                } else if let Some(gate) = &gate {
+                                    gate.0.finish();
+                                }
+                                return Err(error);
+                            }
+                            if let Some(gate) = &gate {
+                                gate.0.finish();
+                            }
+                        }
                     }
                     return Ok(Some(resp));
                 }
@@ -1663,8 +1763,21 @@ impl DialogInner {
         Ok(None)
     }
 
-    pub(super) async fn do_request(self: &Arc<Self>, request: Request) -> Result<Option<Response>> {
-        self.send_dialog_request(request).boxed().await
+    pub(super) fn do_request(
+        self: &Arc<Self>,
+        request: Request,
+    ) -> futures::future::BoxFuture<'_, Result<Option<Response>>> {
+        self.send_dialog_request(request, None).boxed()
+    }
+
+    pub(super) async fn do_reinvite(
+        self: &Arc<Self>,
+        request: Request,
+        options: super::reinvite::ReinviteOptions,
+    ) -> Result<Option<Response>> {
+        self.send_dialog_request(request, Some(options))
+            .boxed()
+            .await
     }
 
     pub(super) fn reserve_invite(&self, tx: &Transaction) -> Result<()> {
@@ -1687,16 +1800,15 @@ impl DialogInner {
         reason: TerminatedReason,
     ) -> Result<()> {
         let initial_ack = self.initial_ack.lock().clone();
-        if let Some(ack) = initial_ack {
+        let reinvite_ack = self.reinvite_ack.lock().clone();
+        for ack in [initial_ack, reinvite_ack].into_iter().flatten() {
             ack.done.cancelled().await;
             // The peer may have ended the dialog while our ACK was blocked.
             if self.is_terminated() {
                 return Ok(());
             }
             if !ack.completed.load(Ordering::SeqCst) {
-                return Err(crate::Error::Error(
-                    "initial INVITE ACK was interrupted".into(),
-                ));
+                return Err(crate::Error::Error("INVITE ACK was interrupted".into()));
             }
         }
         let result = self.do_request(request).await;
@@ -1936,6 +2048,7 @@ impl DialogInner {
             cancel_requested: AtomicBool::new(false),
             cancel_deferred: AtomicBool::new(false),
             initial_ack: Mutex::new(None),
+            reinvite_ack: Mutex::new(None),
         }))
     }
     fn build_restored_initial_request(
