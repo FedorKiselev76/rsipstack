@@ -1546,6 +1546,11 @@ impl DialogInner {
                     }
                     if let Some(options) = &options {
                         if status.kind() == StatusCodeKind::Successful {
+                            let gate = options.answer_handler.as_ref().map(|_| {
+                                let gate = InviteAck::new();
+                                self.reinvite_ack.lock().replace(gate.clone());
+                                super::reinvite::AckGuard(gate)
+                            });
                             let answer = if let Some(handler) = &options.answer_handler {
                                 self.answer_reinvite(&mut tx, &resp, handler).await
                             } else {
@@ -1570,11 +1575,19 @@ impl DialogInner {
                                         self.id.lock().clone(),
                                         TerminatedReason::UacOther(StatusCode::NotAcceptableHere),
                                     ));
+                                    if let Some(gate) = &gate {
+                                        gate.0.finish();
+                                    }
                                     if let Ok(bye) = bye {
                                         self.do_request(bye).await.ok();
                                     }
+                                } else if let Some(gate) = &gate {
+                                    gate.0.finish();
                                 }
                                 return Err(error);
+                            }
+                            if let Some(gate) = &gate {
+                                gate.0.finish();
                             }
                         }
                     }

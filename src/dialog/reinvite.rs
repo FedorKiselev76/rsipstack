@@ -188,7 +188,7 @@ impl HandleControl {
         self.acknowledged.cancel();
     }
 }
-struct AckGuard(Arc<InviteAck>);
+pub(super) struct AckGuard(pub(super) Arc<InviteAck>);
 impl Drop for AckGuard {
     fn drop(&mut self) {
         self.0.done.cancel();
@@ -423,9 +423,6 @@ impl DialogInner {
         handler: &Arc<dyn InviteAnswerHandler>,
     ) -> Result<()> {
         use crate::platform::{select3, Which3};
-        let ack_gate = InviteAck::new();
-        let _guard = AckGuard(ack_gate.clone());
-        self.reinvite_ack.lock().replace(ack_gate.clone());
         let mut terminal_event = None;
         let mut answer = core::pin::pin!(handler.answer(response.clone()));
         let mut deadline =
@@ -482,11 +479,6 @@ impl DialogInner {
         tx.last_response = Some(response.clone());
         tx.last_ack = Some(ack);
         tx.send_ack(tx.connection.clone()).await?;
-        // On failure, wake a concurrent local BYE with an interrupted result;
-        // the owning operation sends the one cleanup BYE itself.
-        if failure.is_none() {
-            ack_gate.finish();
-        }
         if let Some(event) = terminal_event {
             tx.tu_sender.send(event).ok();
         }

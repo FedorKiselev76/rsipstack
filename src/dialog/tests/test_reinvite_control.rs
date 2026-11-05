@@ -503,10 +503,22 @@ async fn failed_or_expired_answer_sends_rejecting_ack_then_bye() -> crate::Resul
         let success = success_with_offer(&request, &format!("sip:peer@{}", peer.local_addr()?))?;
         peer.send_to(success.to_string().as_bytes(), address)
             .await?;
+        // Race a local teardown with the timed-out answer. It must join the
+        // cleanup, not fail or issue a second BYE before the rejecting ACK.
+        let local_bye = if wait {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let sender = dialog.clone();
+            Some(tokio::spawn(async move { sender.bye().await }))
+        } else {
+            None
+        };
         let (ack, _) = recv_request(&peer, Method::Ack).await;
         assert_eq!(ack.body, REJECTED);
         let (bye, _) = recv_request(&peer, Method::Bye).await;
         reply(&peer, address, &bye, 200, "OK").await;
+        if let Some(local_bye) = local_bye {
+            local_bye.await.unwrap()?;
+        }
         assert!(tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .unwrap()
