@@ -18,6 +18,7 @@ use crate::sip::{
 use crate::{
     transaction::{
         endpoint::EndpointInnerRef,
+        invite_usage::InviteUsage,
         key::{TransactionKey, TransactionRole},
         make_uuid_v4,
         transaction::{Transaction, TransactionEventSender},
@@ -85,7 +86,7 @@ impl TransactionHandle {
 /// * `Trying` - Dialog has received a 100 Trying response
 /// * `Early` - Dialog is in early state (1xx response received, except 100)
 /// * `WaitAck` - Server dialog waiting for ACK after sending 2xx response
-/// * `Confirmed` - Dialog is established and confirmed (2xx response received/sent and ACK sent/received)
+/// * `Confirmed` - UAC received 2xx (ACK may still be sending); UAS received ACK
 /// * `Updated` - Dialog received an UPDATE request
 /// * `Notify` - Dialog received a NOTIFY request
 /// * `Info` - Dialog received an INFO request
@@ -309,6 +310,7 @@ pub(super) struct RemoteTarget {
 /// * `tu_sender` - Transaction user sender
 /// * `initial_request` - The initial request that created this dialog
 pub struct DialogInner {
+    pub(super) invite_usage: Arc<Mutex<InviteUsage>>,
     pub role: TransactionRole,
     pub cancel_token: CancellationToken,
     pub id: Mutex<DialogId>,
@@ -354,12 +356,33 @@ pub struct DialogInner {
     pub(super) cancel_requested: AtomicBool,
     /// That CANCEL waits for a provisional response (RFC 3261 §9.1).
     pub(super) cancel_deferred: AtomicBool,
+    pub(super) initial_ack: Mutex<Option<Arc<InitialInviteAck>>>,
 }
 
 pub type DialogStateReceiver = UnboundedReceiver<DialogState>;
 pub type DialogStateSender = UnboundedSender<DialogState>;
 
 pub(super) type DialogInnerRef = Arc<DialogInner>;
+
+/// Outgoing teardown waits for the initial ACK attempt; incoming BYE does not.
+pub(super) struct InitialInviteAck {
+    pub done: CancellationToken,
+    completed: AtomicBool,
+}
+
+impl InitialInviteAck {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            done: CancellationToken::new(),
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    pub fn finish(&self) {
+        self.completed.store(true, Ordering::SeqCst);
+        self.done.cancel();
+    }
+}
 
 impl DialogState {
     pub fn id(&self) -> &DialogId {
@@ -492,6 +515,7 @@ impl DialogInner {
         let session_id = Self::extract_session_id(&initial_request, role);
 
         Ok(Self {
+            invite_usage: Arc::new(Mutex::new(InviteUsage::default())),
             role,
             cancel_token: CancellationToken::new(),
             id: Mutex::new(id.clone()),
@@ -518,6 +542,7 @@ impl DialogInner {
             dialback_target: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
             cancel_deferred: AtomicBool::new(false),
+            initial_ack: Mutex::new(None),
         })
     }
     /// Extract RFC 7989 Session-ID state from the initial request.
@@ -602,8 +627,10 @@ impl DialogInner {
         self.local_seq.load(Ordering::Relaxed)
     }
     pub fn increment_local_seq(&self) -> u32 {
-        self.local_seq.fetch_add(1, Ordering::Relaxed);
-        self.local_seq.load(Ordering::Relaxed)
+        // Return this caller's reservation, not a subsequent caller's value.
+        self.local_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
     }
 
     pub fn update_remote_tag(&self, tag: &str) -> Result<()> {
@@ -804,7 +831,7 @@ impl DialogInner {
         *self.remote_contact.lock() = contact;
     }
 
-    pub(super) fn is_target_refresh(method: Method) -> bool {
+    pub(super) fn is_target_refresh(method: &Method) -> bool {
         matches!(method, Method::Invite | Method::Update)
     }
 
@@ -855,10 +882,10 @@ impl DialogInner {
         *last = Some(cseq);
     }
 
-    fn accepts_target_refresh(method: Method, response: &Response) -> bool {
+    fn accepts_target_refresh(method: &Method, response: &Response) -> bool {
         Self::is_target_refresh(method)
             && (response.status_code.kind() == StatusCodeKind::Successful
-                || (method == Method::Invite
+                || (*method == Method::Invite
                     && response.status_code.kind() == StatusCodeKind::Provisional
                     && response.status_code != StatusCode::Trying
                     && response.header_contains_token("Require", "100rel")
@@ -903,7 +930,7 @@ impl DialogInner {
 
         let cseq_header = CSeq {
             seq: cseq.unwrap_or_else(|| self.increment_local_seq()),
-            method,
+            method: method.clone(),
         };
 
         for via in vias {
@@ -1237,6 +1264,7 @@ impl DialogInner {
             self.endpoint_inner.clone(),
             affinity_connection,
         );
+        self.reserve_invite(&tx)?;
 
         if let Some(route) = tx.original.route_header() {
             if let Ok(first_route) = route.typed() {
@@ -1375,7 +1403,7 @@ impl DialogInner {
                     // In-dialog responses cannot establish a different dialog.
                     // Do not let a mismatched tag rewrite either the target or
                     // the tag used for the next PRACK/request.
-                    if Self::is_target_refresh(method)
+                    if Self::is_target_refresh(&method)
                         && !DialogId::try_from((&resp, TransactionRole::Client))
                             .is_ok_and(|id| id == *self.id.lock())
                     {
@@ -1415,6 +1443,14 @@ impl DialogInner {
                                 id = self.id.lock().to_string(),
                                 "received {} response after auth sent", status
                             );
+                            // A failed in-dialog request does not undo the
+                            // established session (RFC 3261 sections 12/14.1).
+                            if self.is_confirmed() {
+                                if method != Method::PRack {
+                                    self.clear_remote_reliable();
+                                }
+                                return Ok(Some(resp));
+                            }
                             self.transition(DialogState::Terminated(
                                 id,
                                 TerminatedReason::ProxyAuthRequired,
@@ -1427,6 +1463,7 @@ impl DialogInner {
                                 _ => self.increment_local_seq(),
                             };
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
+                            self.reserve_invite(&tx)?;
                             tx.send().await?;
                             continue;
                         } else {
@@ -1434,6 +1471,15 @@ impl DialogInner {
                                 id = self.id.lock().to_string(),
                                 "received 407 response without auth option"
                             );
+                            // Return the final challenge to the application;
+                            // the established dialog remains available for
+                            // another operation or normal call teardown.
+                            if self.is_confirmed() {
+                                if method != Method::PRack {
+                                    self.clear_remote_reliable();
+                                }
+                                return Ok(Some(resp));
+                            }
                             self.transition(DialogState::Terminated(
                                 id,
                                 TerminatedReason::ProxyAuthRequired,
@@ -1447,7 +1493,7 @@ impl DialogInner {
                         method = %method,
                         "dialog do_request done: {:?}", status
                     );
-                    if Self::is_target_refresh(method)
+                    if Self::is_target_refresh(&method)
                         && status.kind() == StatusCodeKind::Successful
                     {
                         self.refresh_target_from_response(&resp)?;
@@ -1467,11 +1513,34 @@ impl DialogInner {
         self.send_dialog_request(request).boxed().await
     }
 
+    pub(super) fn reserve_invite(&self, tx: &Transaction) -> Result<()> {
+        tx.reserve_invite(&self.invite_usage).map_err(|_| {
+            crate::Error::DialogError(
+                "an INVITE transaction is already in progress".into(),
+                self.id.lock().clone(),
+                StatusCode::RequestPending,
+            )
+        })
+    }
+
     /// Send the BYE that ends this dialog. RFC 3261 §15.1.1: the session ends
     /// once the BYE is handed to its transaction, and a 481, a 408 or no
     /// response ends the dialog. So whatever the transaction returns, the
     /// dialog is `Terminated(reason)`; a failure is still returned.
     pub(super) async fn send_bye(&self, request: Request, reason: TerminatedReason) -> Result<()> {
+        let initial_ack = self.initial_ack.lock().clone();
+        if let Some(ack) = initial_ack {
+            ack.done.cancelled().await;
+            // The peer may have ended the dialog while our ACK was blocked.
+            if self.is_terminated() {
+                return Ok(());
+            }
+            if !ack.completed.load(Ordering::SeqCst) {
+                return Err(crate::Error::Error(
+                    "initial INVITE ACK was interrupted".into(),
+                ));
+            }
+        }
         let result = self.do_request(request).await;
         let id = self.id.lock().clone();
         self.transition(DialogState::Terminated(id, reason));
@@ -1664,6 +1733,7 @@ impl DialogInner {
         ));
 
         Ok(Some(Self {
+            invite_usage: Arc::new(Mutex::new(InviteUsage::default())),
             role,
             cancel_token: CancellationToken::new(),
 
@@ -1700,6 +1770,7 @@ impl DialogInner {
             dialback_target: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
             cancel_deferred: AtomicBool::new(false),
+            initial_ack: Mutex::new(None),
         }))
     }
     fn build_restored_initial_request(
@@ -1799,7 +1870,11 @@ impl DialogInner {
     /// `cancel()` was called. Decided under the state lock `cancel()` takes,
     /// so a racing `cancel()` is either seen here or sees `Confirmed`.
     /// Returns whether the INVITE was cancelled.
-    pub(super) fn confirm_unless_cancelled(&self, confirmed: DialogState) -> bool {
+    pub(super) fn confirm_unless_cancelled(
+        &self,
+        confirmed: DialogState,
+        register: impl FnOnce(),
+    ) -> bool {
         let id = self.id.lock().clone();
         let mut state = self.state.lock();
         if self.cancel_requested.load(Ordering::SeqCst) {
@@ -1807,6 +1882,12 @@ impl DialogInner {
             self.transition_locked(&mut state, cancelled);
             return true;
         }
+        if state.is_terminated() {
+            return false;
+        }
+        // Publish the full dialog key before notifying the application. A
+        // concurrent handler cannot inspect the state until this lock releases.
+        register();
         self.transition_locked(&mut state, confirmed);
         false
     }
@@ -1848,7 +1929,7 @@ impl DialogInner {
         tx: &mut Transaction,
         mut rx: TransactionCommandReceiver,
     ) -> Result<()> {
-        let target = if Self::is_target_refresh(tx.original.method) {
+        let target = if Self::is_target_refresh(&tx.original.method) {
             match Self::parse_target_refresh_contact(&tx.original) {
                 Ok(target) => target,
                 Err(_) => return tx.reply(StatusCode::BadRequest).await,
@@ -1869,7 +1950,7 @@ impl DialogInner {
                         let is_final = status.kind() != StatusCodeKind::Provisional;
                         let response = self.make_response(&tx.original, status, headers, body);
                         let accepts_refresh =
-                            Self::accepts_target_refresh(tx.original.method, &response);
+                            Self::accepts_target_refresh(&tx.original.method, &response);
                         tx.respond(response).await?;
 
                         // Commit only once the accepting response was sent.

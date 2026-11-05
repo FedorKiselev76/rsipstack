@@ -13,6 +13,7 @@ use crate::transaction::make_tag;
 use crate::transaction::transaction::transaction_event_sender_noop;
 use crate::transaction::{endpoint::EndpointInnerRef, transaction::Transaction};
 use crate::Result;
+use alloc::collections::btree_map::Entry;
 use core::sync::atomic::{AtomicU32, Ordering};
 use tracing::debug;
 
@@ -205,6 +206,7 @@ impl DialogLayer {
         }
 
         let dialog = InviteDialog::from_inner(Arc::new(dlg_inner));
+        dialog.inner.reserve_invite(tx)?;
         dialog.inner.set_server_connection(tx.connection.clone());
         self.inner
             .dialogs
@@ -418,8 +420,10 @@ impl DialogLayer {
     }
 
     pub fn increment_last_seq(&self) -> u32 {
-        self.inner.last_seq.fetch_add(1, Ordering::Relaxed);
-        self.inner.last_seq.load(Ordering::Relaxed)
+        self.inner
+            .last_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
     }
 
     pub fn len(&self) -> usize {
@@ -469,14 +473,53 @@ impl DialogLayer {
     ///
     /// Restores only CONFIRMED snapshots.
     /// Non-confirmed snapshots are ignored (warn inside try_restore_from_snapshot).
+    /// Restores without authentication credentials. To supply credentials from
+    /// the application's configuration, use
+    /// [`Self::restore_from_snapshot_with_credential`].
     ///
     /// Returns:
     /// - Ok(true)  => restored and inserted
     /// - Ok(false) => skipped (already exists or not confirmed)
+    ///
+    /// Concurrent restores of the same dialog insert at most one instance;
+    /// an existing dialog is never replaced by a restored snapshot.
     pub fn restore_from_snapshot(
         &self,
         snapshot: DialogSnapshot,
         state_sender: DialogStateSender,
+    ) -> crate::Result<bool> {
+        self.restore_from_snapshot_with_credential(snapshot, state_sender, None)
+    }
+
+    /// Restore a confirmed dialog with optional SIP digest credentials.
+    ///
+    /// Credentials are supplied by the application, not stored in
+    /// [`DialogSnapshot`]. They are used by the existing authentication logic
+    /// when an outgoing in-dialog request receives a 401/407 challenge, for
+    /// either the original client or server role.
+    ///
+    /// Passing `None` is equivalent to [`Self::restore_from_snapshot`].
+    /// Returns `Ok(true)` when inserted, or `Ok(false)` if the dialog already
+    /// exists or the snapshot is not confirmed. An existing dialog's
+    /// credentials are not updated by a skipped restore.
+    ///
+    /// ```rust,no_run
+    /// use rsipstack::dialog::{
+    ///     authenticate::Credential,
+    ///     dialog::{DialogSnapshot, DialogStateSender},
+    ///     dialog_layer::DialogLayer,
+    /// };
+    /// # fn restore(layer: &DialogLayer, snapshot: DialogSnapshot,
+    /// #     states: DialogStateSender, credential: Credential) -> rsipstack::Result<()> {
+    /// layer.restore_from_snapshot_with_credential(snapshot, states, Some(credential))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn restore_from_snapshot_with_credential(
+        &self,
+        snapshot: DialogSnapshot,
+        state_sender: DialogStateSender,
+        credential: Option<Credential>,
     ) -> crate::Result<bool> {
         // Already restored?
         if self.get_dialog(&snapshot.id).is_some() {
@@ -485,7 +528,7 @@ impl DialogLayer {
 
         let tu_sender = transaction_event_sender_noop();
 
-        let Some(inner) = DialogInner::try_restore_from_snapshot(
+        let Some(mut inner) = DialogInner::try_restore_from_snapshot(
             snapshot,
             self.endpoint.clone(),
             state_sender,
@@ -496,14 +539,24 @@ impl DialogLayer {
             return Ok(false);
         };
 
+        inner.credential = credential;
         let inner = Arc::new(inner);
         let dialog = Dialog::from_inner(inner.role, inner.clone());
 
         let key = dialog.id().to_string();
 
-        self.inner.dialogs.insert(key, dialog);
-
-        Ok(true)
+        // Another restore or live dialog may have won while we built this one.
+        // Check and insert under the same registry lock, without replacing it.
+        Ok(self
+            .inner
+            .dialogs
+            .with_mut(|dialogs| match dialogs.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(dialog);
+                    true
+                }
+                Entry::Occupied(_) => false,
+            }))
     }
 
     pub fn remove_dialog(&self, id: &DialogId) {

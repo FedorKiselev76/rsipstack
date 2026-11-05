@@ -1,8 +1,10 @@
 use super::endpoint::EndpointInnerRef;
+use super::invite_usage::{InviteReservation, InviteUsage};
 use super::key::TransactionKey;
 use super::{SipConnection, TransactionState, TransactionTimer, TransactionType};
 use crate::dialog::DialogId;
 use crate::platform::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use crate::platform::sync::Mutex;
 use crate::prelude::*;
 use crate::sip::{
     ContentLength, HasHeaders, Header, HeadersExt, Method, Request, Response, SipMessage,
@@ -185,6 +187,7 @@ pub struct Transaction {
     pub timer_m: Option<u64>, // client invite only (Accepted-state 64*T1 per RFC 6026 §7.2)
     retransmission: bool,
     is_cleaned_up: bool,
+    invite_reservation: Mutex<Option<InviteReservation>>,
 }
 
 impl Transaction {
@@ -227,10 +230,27 @@ impl Transaction {
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
+            invite_reservation: Mutex::new(None),
         };
         tx.endpoint_inner
             .attach_transaction(&tx.key, tx.tu_sender.clone());
         tx
+    }
+
+    pub(crate) fn reserve_invite(
+        &self,
+        usage: &Arc<Mutex<InviteUsage>>,
+    ) -> core::result::Result<(), TransactionRole> {
+        if self.original.method != Method::Invite {
+            return Ok(());
+        }
+        let mut slot = self.invite_reservation.lock();
+        if slot.is_none() {
+            let mut reservation = InviteReservation::acquire(usage, self.role())?;
+            reservation.transition(&self.state);
+            *slot = Some(reservation);
+        }
+        Ok(())
     }
 
     pub fn new_client(
@@ -809,13 +829,23 @@ impl Transaction {
     /// dedicated cancellation channel that the transaction itself
     /// observes via `TransactionEvent::Terminate`.
     pub async fn receive(&mut self) -> Option<SipMessage> {
+        self.receive_with_response_observer(|_| {}).await
+    }
+
+    /// Let the dialog install its state before an automatic ACK can suspend
+    /// reception. The observer is synchronous and only sees accepted responses.
+    pub(crate) async fn receive_with_response_observer(
+        &mut self,
+        mut observer: impl FnMut(&Response) + Send,
+    ) -> Option<SipMessage> {
         while let Some(event) = self.tu_receiver.recv().await {
             match event {
                 TransactionEvent::Received(msg, connection) => {
                     if let Some(msg) = match msg {
                         SipMessage::Request(req) => self.on_received_request(req, connection).await,
                         SipMessage::Response(resp) => {
-                            self.on_received_response(resp, connection).await
+                            self.on_received_response(resp, connection, &mut observer)
+                                .await
                         }
                     } {
                         return Some(msg);
@@ -829,6 +859,7 @@ impl Transaction {
                 }
                 TransactionEvent::Terminate(key) => {
                     debug!(%key, "received terminate event");
+                    self.invite_reservation.lock().take();
                     return None;
                 }
             }
@@ -1062,6 +1093,7 @@ impl Transaction {
         &mut self,
         resp: Response,
         connection: Option<SipConnection>,
+        observer: &mut (impl FnMut(&Response) + Send),
     ) -> Option<SipMessage> {
         match self.transaction_type {
             TransactionType::ServerInvite | TransactionType::ServerNonInvite => return None,
@@ -1080,6 +1112,7 @@ impl Transaction {
                 self.transition(TransactionState::Accepted).ok()?;
             }
             self.last_response.replace(resp.clone());
+            observer(&resp);
             return Some(SipMessage::Response(resp));
         }
         let new_state = match resp.status_code.kind() {
@@ -1169,6 +1202,7 @@ impl Transaction {
 
         self.transition(new_state).ok();
 
+        observer(&resp);
         if auto_ack_client_invite {
             if let Err(e) = self.send_ack(connection).await {
                 warn!(
@@ -1637,6 +1671,9 @@ impl Transaction {
             "transition"
         );
         self.state = state;
+        if let Some(reservation) = self.invite_reservation.lock().as_mut() {
+            reservation.transition(&self.state);
+        }
         Ok(self.state.clone())
     }
 
@@ -1702,6 +1739,7 @@ impl Transaction {
     }
 
     fn cleanup(&mut self) {
+        self.invite_reservation.lock().take();
         if self.is_cleaned_up {
             return;
         }
@@ -1753,7 +1791,11 @@ impl Transaction {
                     self.last_ack.take().map(SipMessage::Request)
                 }
                 TransactionType::ServerNonInvite => {
-                    self.last_response.take().map(SipMessage::Response)
+                    if self.connection.as_ref().is_some_and(|c| c.is_reliable()) {
+                        None
+                    } else {
+                        self.last_response.take().map(SipMessage::Response)
+                    }
                 }
                 // Kept: the matching ACK terminates an Accepted server
                 // INVITE before the dialog reads the 2xx for

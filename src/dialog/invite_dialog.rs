@@ -12,6 +12,7 @@
 //! [`ClientInviteDialog`]: crate::dialog::client_dialog::ClientInviteDialog
 
 use super::dialog::DialogInner;
+use super::dialog::InitialInviteAck;
 use super::dialog::{Dialog, DialogInnerRef, DialogState, TerminatedReason, TransactionHandle};
 use super::subscription::{ClientSubscriptionDialog, ServerSubscriptionDialog};
 use super::DialogId;
@@ -25,15 +26,17 @@ use crate::Result;
 use core::sync::atomic::Ordering;
 use tracing::{debug, info, trace, warn};
 
-/// Jittered glare backoff: 2.1–4.0 s (RFC 3261 §14.1 wants random spacing).
-/// `AtomicUsize`: xtensa has no 64-bit atomics.
-fn glare_backoff_ms() -> u64 {
-    static COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let mut x = (COUNTER.fetch_add(1, Ordering::Relaxed) as u64) ^ 0x9E37_79B9_7F4A_7C15;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    2100 + (x % 1900)
+/// RFC 3261 section 14.1 gives the Call-ID owner and its peer disjoint
+/// retry windows, in 10 ms units. The dialog role identifies that owner,
+/// regardless of which party is sending this particular re-INVITE.
+fn glare_backoff_ms(role: TransactionRole) -> u64 {
+    let mut bytes = [0u8; 8];
+    crate::transaction::fill_random_bytes(&mut bytes);
+    let random = u64::from_le_bytes(bytes);
+    match role {
+        TransactionRole::Client => (210 + random % 191) * 10,
+        TransactionRole::Server => (random % 201) * 10,
+    }
 }
 
 /// Unified INVITE dialog that can act as either a UAS (Server) or UAC (Client).
@@ -45,6 +48,16 @@ fn glare_backoff_ms() -> u64 {
 #[derive(Clone)]
 pub struct InviteDialog {
     pub(super) inner: DialogInnerRef,
+}
+
+// Wake local teardown if the INVITE driver is dropped during ACK. It must
+// report an interrupted ACK instead of waiting forever or sending BYE first.
+struct InitialAckGuard(Arc<InitialInviteAck>);
+
+impl Drop for InitialAckGuard {
+    fn drop(&mut self) {
+        self.0.done.cancel();
+    }
 }
 
 impl InviteDialog {
@@ -326,9 +339,20 @@ impl InviteDialog {
 
     /// Drive the outbound INVITE transaction until a final response arrives.
     /// Only meaningful for UAC dialogs.
+    /// `Confirmed` is notified before sending the initial ACK, allowing an
+    /// incoming BYE immediately. This method returns after the ACK attempt;
+    /// local `bye()`/`hangup()` calls wait for that attempt to complete.
     pub async fn process_invite(
         &self,
         tx: &mut Transaction,
+    ) -> Result<(DialogId, Option<Response>)> {
+        self.process_invite_with_registration(tx, |_| {}).await
+    }
+
+    pub(super) async fn process_invite_with_registration(
+        &self,
+        tx: &mut Transaction,
+        mut register: impl FnMut(&DialogId) + Send,
     ) -> Result<(DialogId, Option<Response>)> {
         if self.role() != TransactionRole::Client {
             return Err(crate::Error::DialogError(
@@ -339,6 +363,7 @@ impl InviteDialog {
         }
         use super::authenticate::{handle_client_authenticate, AuthRetry};
 
+        self.inner.reserve_invite(tx)?;
         self.inner.transition(DialogState::Calling(self.id()));
         let mut auth = AuthRetry::new();
         tx.send().await?;
@@ -348,7 +373,23 @@ impl InviteDialog {
         self.inner.set_server_connection(tx.connection.clone());
         let mut dialog_id = self.id();
         let mut final_response = None;
-        while let Some(msg) = tx.receive().await {
+        loop {
+            let ack = InitialInviteAck::new();
+            let _ack_guard = InitialAckGuard(ack.clone());
+            let mut established = Ok(false);
+            let msg = tx
+                .receive_with_response_observer(|resp| {
+                    let peer_uuid = resp.session_id_header().and_then(|s| s.local_uuid());
+                    self.inner.observe_peer_session_uuid(peer_uuid);
+                    if resp.status_code.kind() == StatusCodeKind::Successful {
+                        self.inner.initial_ack.lock().replace(ack.clone());
+                        established = self.establish_from_2xx(resp, &mut register);
+                    }
+                })
+                .await;
+            ack.finish();
+            let cancelled = established?;
+            let Some(msg) = msg else { break };
             match msg {
                 SipMessage::Request(_) => {}
                 SipMessage::Response(resp) => {
@@ -393,6 +434,7 @@ impl InviteDialog {
                                 credential,
                             )
                             .await?;
+                            self.inner.reserve_invite(tx)?;
                             tx.send().await?;
                             self.inner.set_server_connection(tx.connection.clone());
                             self.inner.update_remote_tag("").ok();
@@ -431,10 +473,10 @@ impl InviteDialog {
                         {
                             self.inner.update_route_set_from_response(&resp);
                         }
-                        StatusCode::OK => {
-                            self.update_remote_target_from_2xx(&resp)?;
-                            let confirmed = DialogState::Confirmed(dialog_id.clone(), resp.clone());
-                            if self.inner.confirm_unless_cancelled(confirmed) {
+                        _ if resp.status_code.kind() == StatusCodeKind::Successful => {
+                            // Already established before the ACK. Never confirm
+                            // again: an incoming BYE may have terminated it.
+                            if cancelled {
                                 self.bye_2xx_of_cancelled(resp);
                             }
                         }
@@ -450,6 +492,22 @@ impl InviteDialog {
             }
         }
         Ok((dialog_id, final_response))
+    }
+
+    fn establish_from_2xx(
+        &self,
+        resp: &Response,
+        register: &mut impl FnMut(&DialogId),
+    ) -> Result<bool> {
+        if let Some(tag) = resp.to_header()?.tag()? {
+            self.inner.update_remote_tag(tag.value())?;
+        }
+        self.update_remote_target_from_2xx(resp)?;
+        let id = self.id();
+        let confirmed = DialogState::Confirmed(id.clone(), resp.clone());
+        Ok(self
+            .inner
+            .confirm_unless_cancelled(confirmed, || register(&id)))
     }
 
     /// Take the route set, Contact and remote target from a 2xx to the INVITE.
@@ -544,6 +602,7 @@ impl InviteDialog {
     /// Send a BYE request with custom headers (role-aware termination reason).
     ///
     /// BYE can only be sent from `Confirmed` (or `WaitAck` for a server dialog).
+    /// A UAC waits for its initial ACK attempt before sending the BYE.
     /// Calling BYE in any other non-terminated state returns an error; terminated
     /// dialogs remain a silent no-op.
     ///
@@ -590,6 +649,8 @@ impl InviteDialog {
     }
 
     /// Send a re-INVITE request to modify the session.
+    /// Returns `DialogError` with `RequestPending` while another INVITE
+    /// transaction prevents a new local INVITE (RFC 3261 §14.1).
     pub async fn reinvite(
         &self,
         headers: Option<Vec<Header>>,
@@ -610,7 +671,8 @@ impl InviteDialog {
     }
 
     /// re-INVITE with glare handling (RFC 3261 §14.1): on 491 retry after a
-    /// jittered 2.1–4.0 s backoff, up to `max_attempts` total.
+    /// jittered backoff, up to `max_attempts` total. The original caller
+    /// (Call-ID owner) waits 2.1–4.0 s; the original callee waits 0–2.0 s.
     pub async fn reinvite_with_glare_retry(
         &self,
         headers: Option<Vec<Header>>,
@@ -631,7 +693,7 @@ impl InviteDialog {
                     "re-INVITE glare: exhausted {max_attempts} retries (491)"
                 )));
             }
-            let backoff_ms = glare_backoff_ms();
+            let backoff_ms = glare_backoff_ms(self.role());
             warn!(
                 id = %self.id(),
                 attempt,
@@ -782,8 +844,20 @@ impl InviteDialog {
         }
 
         let cseq = tx.original.cseq_header()?.seq()?;
-        let remote_seq = self.inner.remote_seq.load(Ordering::Relaxed);
-        if remote_seq > 0 && cseq < remote_seq {
+        // ACK and CANCEL reuse their INVITE's CSeq and are matched by the
+        // transaction layer. Neither participates in the dialog sequence.
+        // Re-evaluate the comparison after every competing update: a failed
+        // one-shot CAS must not admit a stale request or lose a newer CSeq.
+        let sequence = if matches!(tx.original.method, Method::Ack | Method::Cancel) {
+            Ok(self.inner.remote_seq.load(Ordering::Relaxed))
+        } else {
+            self.inner
+                .remote_seq
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remote_seq| {
+                    (cseq >= remote_seq).then_some(cseq)
+                })
+        };
+        if let Err(remote_seq) = sequence {
             match self.role() {
                 // Server discards old requests silently.
                 TransactionRole::Server => {
@@ -810,18 +884,16 @@ impl InviteDialog {
             }
         }
 
-        self.inner
-            .remote_seq
-            .compare_exchange(remote_seq, cseq, Ordering::Relaxed, Ordering::Relaxed)
-            .ok();
-
         if self.inner.is_confirmed() {
             // Validate before the application can change its media state or
             // accept the request. Receiving a Contact alone does not commit it.
-            if DialogInner::is_target_refresh(tx.original.method)
+            if DialogInner::is_target_refresh(&tx.original.method)
                 && DialogInner::parse_target_refresh_contact(&tx.original).is_err()
             {
                 tx.reply(StatusCode::BadRequest).await?;
+                return Ok(());
+            }
+            if !self.admit_incoming_invite(tx).await? {
                 return Ok(());
             }
             match tx.original.method {
@@ -875,6 +947,9 @@ impl InviteDialog {
             }
         }
 
+        if !self.admit_incoming_invite(tx).await? {
+            return Ok(());
+        }
         // Not confirmed — only the UAS side drives the INVITE transaction here.
         if self.role() == TransactionRole::Server {
             match tx.original.method {
@@ -896,6 +971,33 @@ impl InviteDialog {
             }
         }
         Ok(())
+    }
+
+    /// Apply RFC 3261 §14.2 before dispatching an INVITE to the application.
+    async fn admit_incoming_invite(&self, tx: &mut Transaction) -> Result<bool> {
+        if tx.original.method != Method::Invite {
+            return Ok(true);
+        }
+        let Err(pending_role) = tx.reserve_invite(&self.inner.invite_usage) else {
+            return Ok(true);
+        };
+        let (status, headers) = match pending_role {
+            TransactionRole::Client => (StatusCode::RequestPending, None),
+            TransactionRole::Server => {
+                let mut random = [0u8; 4];
+                crate::transaction::fill_random_bytes(&mut random);
+                let delay = u32::from_ne_bytes(random) % 11;
+                (
+                    StatusCode::ServerInternalError,
+                    Some(vec![Header::RetryAfter(delay.to_string().into())]),
+                )
+            }
+        };
+        let response = self
+            .inner
+            .make_response(&tx.original, status, headers, None);
+        tx.respond(response).await?;
+        Ok(false)
     }
 
     async fn handle_bye(&mut self, tx: &mut Transaction) -> Result<()> {
@@ -1142,5 +1244,24 @@ impl TryFrom<InviteDialog> for crate::dialog::client_dialog::ClientInviteDialog 
             ));
         }
         Ok(Self { inner: d.inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glare_backoff_uses_call_id_owner_window_and_ten_ms_units() {
+        for role in [TransactionRole::Client, TransactionRole::Server] {
+            for _ in 0..256 {
+                let delay = glare_backoff_ms(role);
+                match role {
+                    TransactionRole::Client => assert!((2100..=4000).contains(&delay)),
+                    TransactionRole::Server => assert!((0..=2000).contains(&delay)),
+                }
+                assert_eq!(delay % 10, 0, "RFC 3261 section 14.1 uses 10 ms units");
+            }
+        }
     }
 }

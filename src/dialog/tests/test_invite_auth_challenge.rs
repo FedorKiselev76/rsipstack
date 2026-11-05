@@ -10,7 +10,7 @@ use crate::dialog::{
     dialog_layer::DialogLayer,
     invitation::InviteOption,
 };
-use crate::sip::{headers::*, Header, Method, Response, StatusCode, Uri};
+use crate::sip::{headers::*, Header, HeadersExt, Method, Response, StatusCode, Uri};
 use crate::transaction::TransactionReceiver;
 use crate::transport::{udp::UdpConnection, TransportLayer};
 use crate::EndpointBuilder;
@@ -149,6 +149,138 @@ fn credential() -> Credential {
         realm: None,
         auth_username: None,
     }
+}
+
+/// An authentication failure for one in-dialog request must leave the
+/// established session intact and return that request's final response.
+async fn assert_in_dialog_auth(
+    status: StatusCode,
+    with_credential: bool,
+    accept_credentials: bool,
+) -> crate::Result<()> {
+    for method in [
+        Method::Invite,
+        Method::Update,
+        Method::Info,
+        Method::Options,
+    ] {
+        let (p, mut incoming) = peers().await?;
+        let (seen_tx, mut seen) = unbounded_channel();
+        let challenged = status.clone();
+        let port = p.uas_port;
+        let server_method = method.clone();
+        tokio::spawn(async move {
+            while let Some(mut tx) = incoming.recv().await {
+                let initial = tx.original.to_header().unwrap().tag().unwrap().is_none();
+                let authed = answers_challenge(&challenged, &tx.original.headers);
+                let is_test_request = !initial && tx.original.method == server_method;
+                let requires_auth = is_test_request || tx.original.method == Method::Bye;
+                if is_test_request {
+                    seen_tx.send(authed).unwrap();
+                }
+                let status = challenged.clone();
+                tokio::spawn(async move {
+                    if requires_auth && !(authed && accept_credentials) {
+                        tx.reply_with(status.clone(), vec![challenge_header(&status)], None)
+                            .await
+                            .unwrap();
+                    } else {
+                        tx.reply_with(
+                            StatusCode::OK,
+                            vec![Contact::new(format!("<sip:bob@127.0.0.1:{port}>")).into()],
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    while tx.receive().await.is_some() {}
+                });
+            }
+        });
+        let (states, mut events) = unbounded_channel();
+        let (dialog, response) = tokio::time::timeout(
+            PROMPT,
+            p.uac_layer
+                .do_invite(invite_option(&p, with_credential.then(credential)), states),
+        )
+        .await
+        .expect("initial INVITE did not complete")?;
+        assert_eq!(response.unwrap().status_code, StatusCode::OK);
+        while events.try_recv().is_ok() {}
+        let before = dialog.snapshot();
+
+        let response = tokio::time::timeout(PROMPT, async {
+            match method {
+                Method::Invite => dialog.reinvite(None, None).await,
+                Method::Update => dialog.update(None, None).await,
+                Method::Info => dialog.info(None, None).await,
+                Method::Options => dialog.options(None).await,
+                _ => unreachable!(),
+            }
+        })
+        .await
+        .expect("in-dialog auth result must return promptly")?
+        .expect("the final response must be returned");
+        let expected = if with_credential && accept_credentials {
+            StatusCode::OK
+        } else {
+            status.clone()
+        };
+        assert_eq!(response.status_code, expected, "{method}");
+        assert!(dialog.state().is_confirmed(), "{method} ended the call");
+        let after = dialog.snapshot();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.remote_uri, before.remote_uri);
+        assert!(!seen.try_recv().unwrap());
+        if with_credential {
+            assert!(seen.try_recv().unwrap());
+        }
+        assert!(seen.try_recv().is_err(), "unexpected extra auth retry");
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, DialogState::Terminated(..)));
+        }
+        // A failed modification must still permit call teardown, including
+        // when BYE itself receives a final authentication failure.
+        tokio::time::timeout(PROMPT, dialog.bye())
+            .await
+            .expect("BYE did not complete")?;
+        assert!(dialog.state().is_terminated());
+        p.token.cancel();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_dialog_auth_without_credentials_preserves_session() -> crate::Result<()> {
+    for status in [
+        StatusCode::Unauthorized,
+        StatusCode::ProxyAuthenticationRequired,
+    ] {
+        assert_in_dialog_auth(status, false, false).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_dialog_auth_rejected_credentials_preserves_session() -> crate::Result<()> {
+    for status in [
+        StatusCode::Unauthorized,
+        StatusCode::ProxyAuthenticationRequired,
+    ] {
+        assert_in_dialog_auth(status, true, false).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_dialog_auth_successful_retry_preserves_session() -> crate::Result<()> {
+    for status in [
+        StatusCode::Unauthorized,
+        StatusCode::ProxyAuthenticationRequired,
+    ] {
+        assert_in_dialog_auth(status, true, true).await?;
+    }
+    Ok(())
 }
 
 fn is_auth_terminated(state: &DialogState) -> bool {
@@ -410,4 +542,246 @@ async fn test_invite_stale_nonce_retries_are_bounded() -> crate::Result<()> {
 
     p.token.cancel();
     Ok(())
+}
+
+mod restored_dialogs {
+    use super::*;
+    use crate::dialog::authenticate::verify_digest;
+    use crate::dialog::dialog::{Dialog, DialogInner, DialogSnapshot, DialogSnapshotState};
+    use crate::dialog::tests::test_dialog_states::create_invite_request;
+    use crate::dialog::DialogId;
+    use crate::sip::{prelude::HeadersExt, Request};
+    use crate::transaction::key::TransactionRole;
+    use std::sync::Arc;
+
+    fn snapshot(p: &Peers, role: TransactionRole) -> crate::Result<DialogSnapshot> {
+        let request = create_invite_request("alice-tag", "bob-tag", "restore-auth");
+        let id = DialogId::try_from((&request, role))?;
+        let (states, _) = unbounded_channel();
+        let (transactions, _) = unbounded_channel();
+        let inner = DialogInner::new(
+            role,
+            id,
+            request,
+            p.uac_layer.endpoint.clone(),
+            states,
+            Some(Credential {
+                password: "old-secret".into(),
+                ..credential()
+            }),
+            Some(Uri::try_from(format!(
+                "sip:local@127.0.0.1:{}",
+                p.uac_port
+            ))?),
+            transactions,
+        )?;
+        let mut snapshot = inner.snapshot();
+        snapshot.state = DialogSnapshotState::Confirmed;
+        snapshot.local_cseq = 42;
+        snapshot.remote_cseq = 17;
+        snapshot.remote_uri = Uri::try_from(format!("sip:peer@127.0.0.1:{}", p.uas_port))?;
+        snapshot.remote_contact = Some(Contact::new(format!("<{}>", snapshot.remote_uri)));
+        Ok(snapshot)
+    }
+
+    fn restored(p: &Peers, id: &DialogId) -> crate::dialog::invite_dialog::InviteDialog {
+        match p.uac_layer.get_dialog(id) {
+            Some(Dialog::Invite(dialog)) => dialog,
+            _ => panic!("restored INVITE dialog missing"),
+        }
+    }
+
+    fn digest(request: &Request, status: &StatusCode) -> Option<String> {
+        request
+            .headers
+            .iter()
+            .find_map(|header| match (status, header) {
+                (StatusCode::Unauthorized, Header::Authorization(value)) => {
+                    Some(value.value().to_string())
+                }
+                (StatusCode::ProxyAuthenticationRequired, Header::ProxyAuthorization(value)) => {
+                    Some(value.value().to_string())
+                }
+                _ => None,
+            })
+    }
+
+    async fn assert_restored_request_authenticates(method: Method) -> crate::Result<()> {
+        for role in [TransactionRole::Client, TransactionRole::Server] {
+            for status in [
+                StatusCode::Unauthorized,
+                StatusCode::ProxyAuthenticationRequired,
+            ] {
+                let (p, mut incoming) = peers().await?;
+                let snapshot = snapshot(&p, role)?;
+                let (states, _) = unbounded_channel();
+                let cred = Credential {
+                    auth_username: Some("trunk-auth".into()),
+                    ..credential()
+                };
+                assert!(p.uac_layer.restore_from_snapshot_with_credential(
+                    snapshot.clone(),
+                    states,
+                    Some(cred.clone()),
+                )?);
+                let dialog = restored(&p, &snapshot.id);
+                let (seen_tx, mut seen) = unbounded_channel();
+                let challenged = status.clone();
+                let contact = Contact::new(format!("<{}>", snapshot.remote_uri));
+                let server_cred = cred.clone();
+                let server_method = method.clone();
+                tokio::spawn(async move {
+                    while let Some(mut tx) = incoming.recv().await {
+                        if tx.original.method != server_method {
+                            continue;
+                        }
+                        let raw = digest(&tx.original, &challenged);
+                        let valid = raw.as_ref().is_some_and(|raw| {
+                            let auth = crate::sip::typed::Authorization::parse(raw).unwrap();
+                            auth.username == server_cred.digest_username()
+                                && verify_digest(&auth, &server_cred.password, &server_method, raw)
+                        });
+                        seen_tx.send(tx.original.clone()).unwrap();
+                        let challenged = challenged.clone();
+                        let contact = contact.clone();
+                        tokio::spawn(async move {
+                            if valid {
+                                tx.reply_with(StatusCode::OK, vec![contact.into()], None)
+                                    .await
+                                    .unwrap();
+                            } else {
+                                tx.reply_with(
+                                    challenged.clone(),
+                                    vec![challenge_header(&challenged)],
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            }
+                            while tx.receive().await.is_some() {}
+                        });
+                    }
+                });
+
+                let response = tokio::time::timeout(PROMPT, async {
+                    match method {
+                        Method::Invite => dialog.reinvite(None, None).await,
+                        // options() is intentionally a no-op for the UAS role;
+                        // the generic API can send OPTIONS for either role.
+                        Method::Options => dialog.request(Method::Options, None, None).await,
+                        Method::Bye => dialog.bye().await.map(|_| None),
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .expect("restored request did not complete")?;
+                if method == Method::Bye {
+                    assert!(dialog.state().is_terminated());
+                } else {
+                    assert_eq!(response.map(|r| r.status_code), Some(StatusCode::OK));
+                    assert!(dialog.state().is_confirmed());
+                }
+                let first = seen.try_recv().expect("first request");
+                let retry = seen.try_recv().expect("authenticated retry");
+                assert!(digest(&first, &status).is_none());
+                let raw = digest(&retry, &status).expect("matching authentication header");
+                let auth = crate::sip::typed::Authorization::parse(&raw)?;
+                assert_eq!(auth.username, cred.digest_username());
+                assert!(verify_digest(&auth, &cred.password, &method, &raw));
+                assert_eq!(first.cseq_header()?.seq()?, 43);
+                assert_eq!(retry.cseq_header()?.seq()?, 44);
+                assert_eq!(retry.uri, snapshot.remote_uri);
+                assert_eq!(dialog.id(), snapshot.id);
+                assert_eq!(dialog.snapshot().local_cseq, 44);
+                assert_eq!(dialog.snapshot().remote_cseq, snapshot.remote_cseq);
+                assert!(seen.try_recv().is_err(), "unexpected further retry");
+                p.token.cancel();
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restored_options_authenticates_for_both_roles() -> crate::Result<()> {
+        assert_restored_request_authenticates(Method::Options).await
+    }
+
+    #[tokio::test]
+    async fn restored_reinvite_authenticates_for_both_roles() -> crate::Result<()> {
+        assert_restored_request_authenticates(Method::Invite).await
+    }
+
+    #[tokio::test]
+    async fn restored_bye_authenticates_for_both_roles() -> crate::Result<()> {
+        assert_restored_request_authenticates(Method::Bye).await
+    }
+
+    #[tokio::test]
+    async fn legacy_and_none_restore_leave_credentials_unset() -> crate::Result<()> {
+        for role in [TransactionRole::Client, TransactionRole::Server] {
+            let (p, _) = peers().await?;
+            let snapshot = snapshot(&p, role)?;
+            let (states, _) = unbounded_channel();
+            assert!(p
+                .uac_layer
+                .restore_from_snapshot(snapshot.clone(), states.clone())?);
+            assert!(restored(&p, &snapshot.id).inner.credential.is_none());
+            p.uac_layer.remove_dialog(&snapshot.id);
+            assert!(p.uac_layer.restore_from_snapshot_with_credential(
+                snapshot.clone(),
+                states,
+                None,
+            )?);
+            assert!(restored(&p, &snapshot.id).inner.credential.is_none());
+            p.token.cancel();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skipped_restore_keeps_existing_credentials_and_state() -> crate::Result<()> {
+        for role in [TransactionRole::Client, TransactionRole::Server] {
+            let (p, _) = peers().await?;
+            let mut snapshot = snapshot(&p, role)?;
+            let (states, _) = unbounded_channel();
+            snapshot.state = DialogSnapshotState::Early;
+            assert!(!p.uac_layer.restore_from_snapshot_with_credential(
+                snapshot.clone(),
+                states.clone(),
+                Some(credential()),
+            )?);
+            assert!(p.uac_layer.is_empty());
+            snapshot.state = DialogSnapshotState::Confirmed;
+            assert!(p.uac_layer.restore_from_snapshot_with_credential(
+                snapshot.clone(),
+                states.clone(),
+                Some(credential()),
+            )?);
+            let live = restored(&p, &snapshot.id);
+            let seq = live.inner.increment_local_seq();
+            assert!(!p.uac_layer.restore_from_snapshot_with_credential(
+                snapshot.clone(),
+                states.clone(),
+                Some(Credential {
+                    password: "replacement".into(),
+                    ..credential()
+                }),
+            )?);
+            let retained = restored(&p, &snapshot.id);
+            assert!(Arc::ptr_eq(&live.inner, &retained.inner));
+            assert_eq!(
+                retained.inner.credential.as_ref().unwrap().password,
+                "secret"
+            );
+            assert_eq!(retained.snapshot().local_cseq, seq);
+
+            // Taking another snapshot does not serialize runtime credentials.
+            let next_snapshot = retained.snapshot();
+            p.uac_layer.remove_dialog(&snapshot.id);
+            assert!(p.uac_layer.restore_from_snapshot(next_snapshot, states)?);
+            assert!(restored(&p, &snapshot.id).inner.credential.is_none());
+            p.token.cancel();
+        }
+        Ok(())
+    }
 }
