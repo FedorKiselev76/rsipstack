@@ -1,17 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.8.1
 
-- A final 401/407 for an in-dialog request now returns to its caller without
-  terminating a confirmed dialog when credentials are absent or the retry is
-  rejected. Applications can decide whether to retry, report the failed
-  operation, or explicitly hang up. Initial INVITE authentication and early
-  dialog handling are unchanged; an outgoing BYE still ends the dialog.
-  Public signatures, configuration defaults, and snapshot fields are unchanged.
-- Atomically validate and advance the remote CSeq for incoming INVITE-dialog
-  requests. Concurrent requests cannot lose a newer sequence number or pass
-  using a stale comparison. ACK/CANCEL keep their INVITE's CSeq and do not
-  advance the dialog counter; equal CSeq values retain their existing behavior.
+Fourteen fixes and additions merged (#223–#236).
+
+- Dialog: preserve confirmed sessions on in-dialog auth rejection, RFC 3261
+  glare retry windows, distinct concurrent CSeq values, atomic/idempotent
+  snapshot restore, credentials on restore, atomic remote CSeq validation,
+  INVITE overlap/glare handling, and confirm UAC dialogs before awaiting ACK.
+- SIP parsing: extension methods via `Method::Other(String)` (**breaking**:
+  `Method` is no longer `Copy`), RFC 4475 URI/name-addr/Contact/Via validation,
+  and Request-Line/Status-Line/core-header validation.
+- Transactions: Timer J = 0 on reliable transports (RFC 3261 §17.2.2).
+- Tests: PJSUA/SIPp interoperability harness and duplicate Content-Length
+  regression coverage.
+
+No other public signatures, configuration defaults, or snapshot fields changed.
 
 ## 0.8.0
 
