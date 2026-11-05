@@ -1586,13 +1586,12 @@ impl DialogInner {
                     }
 
                     if status.kind() == StatusCodeKind::Provisional {
-                        if method == Method::Invite {
-                            if !self
+                        if method == Method::Invite
+                            && !self
                                 .handle_provisional_response(&resp, &tx.original)
                                 .await?
-                            {
-                                continue;
-                            }
+                        {
+                            continue;
                         }
                         if let Some(sender) = options
                             .as_ref()
