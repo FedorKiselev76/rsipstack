@@ -14,6 +14,7 @@ pub mod invite_dialog;
 pub mod publication;
 pub mod registration;
 pub mod reinvite;
+pub mod reinvite_bridge;
 pub mod server_dialog;
 pub mod subscription;
 
