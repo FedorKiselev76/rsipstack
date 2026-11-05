@@ -12,6 +12,7 @@ use std::{
 use tokio::process::{Child, Command};
 mod extended;
 mod faults;
+mod prack_sdp;
 mod prack_uas;
 mod registration;
 mod subscription;
@@ -64,7 +65,10 @@ impl Sipp {
         std::fs::write(&rendered, xml).required()?;
         // This scenario receives the same ACK twice on purpose. SIPp's UDP
         // duplicate detector would otherwise consume it before the XML step.
-        let duplicate_flags = if matches!(scenario, "duplicate_200" | "prack_lost_response") {
+        let duplicate_flags = if matches!(
+            scenario,
+            "duplicate_200" | "prack_lost_response" | "prack_uas_retransmit"
+        ) {
             vec!["-nr"]
         } else {
             vec![]

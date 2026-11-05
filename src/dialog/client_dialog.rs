@@ -565,6 +565,11 @@ impl ClientInviteDialog {
             "handle request"
         );
 
+        self.inner.attach_reliable_server(tx)?;
+        if self.inner.reject_required_100rel(tx).await? {
+            return Ok(());
+        }
+
         let cseq = tx.original.cseq_header()?.seq()?;
         let remote_seq = self.inner.remote_seq.load(Ordering::Relaxed);
         if remote_seq > 0 && cseq < remote_seq {
@@ -583,6 +588,10 @@ impl ClientInviteDialog {
             .remote_seq
             .compare_exchange(remote_seq, cseq, Ordering::Relaxed, Ordering::Relaxed)
             .ok();
+
+        if tx.original.method == crate::sip::Method::PRack {
+            return self.inner.receive_prack(tx).await;
+        }
 
         if self.inner.is_confirmed() {
             match tx.original.method {
@@ -674,7 +683,8 @@ impl ClientInviteDialog {
         let mut acked = false;
 
         // wait for ACK
-        while let Some(msg) = tx.receive().await {
+        while !tx.is_terminated() {
+            let Some(msg) = tx.receive().await else { break };
             match msg {
                 SipMessage::Request(req) if req.method == crate::sip::Method::Ack => {
                     debug!(id = %self.id(), "received ACK for re-INVITE");

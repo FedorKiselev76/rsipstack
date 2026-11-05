@@ -35,29 +35,33 @@ SIPp's header assertion fails. The expected BYE retains the UUID learned from
 the peer; see [RFC 7989 sections 6 and 8](https://www.rfc-editor.org/rfc/rfc7989.html#section-6).
 Both UDP and TCP probes remain failing until a separate library fix is made.
 
-## Known gaps: incomplete PRACK reliability and validation
+## PRACK / 100rel regression coverage
 
-Use `bash scripts/interop/run.sh known-gaps prack`. Eight probes fail at
-upstream `03f191d`, reproducing the following on both UDP and TCP:
+Use `bash scripts/interop/run.sh regression prack`. All 27 executions use
+`ReliableProvisionalConfig` with an application media handler. Eight former
+known-gap probes are now ordinary regression cases on UDP and TCP:
 
-- `prack_rseq_gap`: after acknowledging RSeq 1, the peer sends RSeq 3 before
-  RSeq 2. rsipstack sends `RAck: 3 1 INVITE`; RFC 3262 section 4 requires
-  leaving the out-of-order response unacknowledged until the sequence is
-  contiguous. SIPp expects the next PRACK to acknowledge RSeq 2.
-- `prack_uas_wrong_rseq` and `prack_uas_wrong_cseq`: rsipstack sends a reliable
-  183 with `RSeq: 1`, but answers PRACK with `RAck: 999 1 INVITE` or
-  `RAck: 1 999 INVITE` with 200. A PRACK that does not match the outstanding
-  reliable response should receive 481 (RFC 3262 section 3). These cases
-  recover with a valid PRACK after the expected rejection.
-- `prack_uas_retransmit`: rsipstack's public `ringing()` API sends one 183
-  carrying Require: 100rel and RSeq: 1. With no PRACK, SIPp receives no repeat
-  within three seconds (the default T1 is 500 ms). RFC 3262 section 3 requires
-  retransmission even over reliable transports. This exposes that the API
-  does not itself manage the UAS reliable-provisional timer.
+- `prack_rseq_gap`: RSeq 3 after RSeq 1 is discarded; the next PRACK
+  acknowledges the contiguous RSeq 2.
+- `prack_uas_wrong_rseq` and `prack_uas_wrong_cseq`: unmatched RAck receives
+  481, then a valid PRACK acknowledges the outstanding provisional. SIPp
+  extracts the stack-generated random RSeq from the response.
+- `prack_uas_retransmit`: the UAS retransmits its reliable 183 on both
+  transports until PRACK arrives. SIPp's automatic UDP duplicate handling
+  is disabled so the scenario itself observes the repeated 183.
 
-These tests distinguish parsing/accepting a PRACK from implementing the full
-100rel state machine. A passing basic PRACK exchange is not evidence that
-the remaining reliability, validation or offer/answer behavior is complete.
+Additional cases cover an offerless INVITE with the answer in PRACK, a new
+SDP offer in PRACK with its answer in 200, and PRACK 401/407 authentication.
+The retry must retain RAck and SDP, advance CSeq and change the Via branch.
+SIPp verifies the 401 digest; the independent Python verifier checks 407
+because SIPp's `verifyauth` only reads Authorization. The tests inspect the
+media callback and final PRACK response as well as the wire exchange.
+
+Library tests additionally cover all three SDP patterns in both roles,
+fork-specific routes and targets, malformed/overflow sequence values,
+queued provisionals and finals, CANCEL followed by late PRACK, callback
+failures, and deterministic 64*T1 exhaustion without a T2 retransmission cap.
+External cases are signaling tests and send no RTP.
 
 ## Known gaps: blocked ACK
 
@@ -86,8 +90,10 @@ accepting other response codes.
 
 ## Executed matrix
 
-There are 161 external-peer test executions:
-147 regression cases and 14 known-gap probes. The lost-PRACK-response and all
+There are 169 external-peer test executions:
+163 regression cases and 6 probes retaining the legacy known-gap names.
+Session-ID and blocked-ACK probes were fixed upstream; their promotion is
+kept in the separate proxy/B2BUA harness change. The lost-PRACK-response and all
 fault-injection cases are UDP-only; the other families run on both transports.
 
 | Area | Exchanges / assertions | Executions |
@@ -97,7 +103,7 @@ fault-injection cases are UDP-only; the other families run on both transports.
 | PJSIP in-dialog methods | INFO in both directions, MESSAGE delivery, OPTIONS rejection without losing the call | 16 |
 | SIPp final responses | 403, 404, 408, 480, 488, 500, 503, 603; ACK and cleanup | 16 |
 | SIPp authentication | 401, 407, stale nonce; no credentials for 401/407 | 10 |
-| Reliable provisional responses | UAC PRACK RAck, duplicate 183, successive RSeq; UDP retry; UAS valid/missing RAck | 11 |
+| Reliable provisional responses | UAC/UAS validation, retransmission, contiguous RSeq, offer/answer in PRACK, 401/407 | 27 |
 | Call progress | 100, 180, SDP in 183, final 200 | 2 |
 | In-dialog methods | OPTIONS, INFO with DTMF body, MESSAGE with text | 2 |
 | Session modification | hold/resume re-INVITEs, 488 rejection, UPDATE | 6 |
@@ -109,7 +115,7 @@ fault-injection cases are UDP-only; the other families run on both transports.
 | Existing subscription | refresh, incoming presence NOTIFY, application reply, unsubscribe | 2 |
 | UDP fault injection with PJSIP | loss in both directions of INVITE, 200, ACK, BYE, CANCEL and their replies; ACK/BYE delays | 20 |
 | UDP races with SIPp | delayed ACK delivery, wrong-tag BYE during blocked ACK, CANCEL crossing held 200, crossed BYEs | 4 |
-| Known-gap probes | SHA-256; Session-ID; PRACK; blocked ACK/BYE ordering | 14 |
+| Probes retaining legacy known-gap names | SHA-256; Session-ID; blocked ACK/BYE ordering | 6 |
 
 The lost-487 case is a regression test. An earlier fixture dropped the server
 INVITE transaction when `dialog.handle()` returned after CANCEL, cancelling
@@ -152,7 +158,7 @@ features. No finite suite covers every SIP message sequence or peer behavior.
 | Area | Not yet exercised with an external peer |
 | --- | --- |
 | Transports | TLS/WSS certificates, WS, IPv6, DNS SRV/NAPTR, reconnects and NAT |
-| PRACK | Offer in PRACK, offerless INVITE, malformed/overflow RSeq, full timer exhaustion |
+| PRACK | External peer malformed/overflow RSeq and full timer exhaustion; PJSIP media negotiation |
 | Dialog races | overlapping re-INVITEs/glare, additional forking and cancellation schedules |
 | Transactions | multi-packet loss bursts, long timer exhaustion, crash/restart recovery |
 | Authentication | multiple challenges, auth-int, sess algorithms, SHA-512/256, rejected credentials |
@@ -196,7 +202,7 @@ Priorities beyond the executed matrix above:
 
 1. Extend the existing UDP fault schedules to loss bursts, re-INVITE glare
    and forking. Add a separate stream disconnect/reconnect fixture for TCP/TLS.
-2. PRACK offer/answer, authentication and timeout exhaustion; session timer
+2. External-peer PRACK timeout exhaustion; session timer
    negotiation, 422 retry, refresh failure and cleanup.
 3. Initial SUBSCRIBE and final NOTIFY, REFER/NOTIFY transfers, redirect chains,
    DNS failover and transport reconnection.

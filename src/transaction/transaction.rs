@@ -188,6 +188,8 @@ pub struct Transaction {
     retransmission: bool,
     is_cleaned_up: bool,
     invite_reservation: Mutex<Option<InviteReservation>>,
+    pub(crate) reliable_provisional:
+        crate::platform::sync::Mutex<Option<Arc<crate::dialog::reliable::ReliableServer>>>,
 }
 
 impl Transaction {
@@ -231,6 +233,7 @@ impl Transaction {
             tu_sender,
             is_cleaned_up: false,
             invite_reservation: Mutex::new(None),
+            reliable_provisional: crate::platform::sync::Mutex::new(None),
         };
         tx.endpoint_inner
             .attach_transaction(&tx.key, tx.tu_sender.clone());
@@ -457,6 +460,11 @@ impl Transaction {
     /// - the connection is missing,
     /// - the underlying transport send fails.
     ///
+    /// When full 100rel is enabled on this INVITE, a subsequent reliable 1xx
+    /// or a 2xx waiting for SDP's PRACK can be queued. Success then means the
+    /// response was accepted for delivery. Keep driving the owning transaction
+    /// to transmit it after PRACK; `last_response` reflects what was sent.
+    ///
     /// # Cancel safety
     ///
     /// **NOT cancel-safe.** The mutation order is: store `last_response`
@@ -483,6 +491,20 @@ impl Transaction {
                 ));
             }
         }
+
+        let reliable = self.reliable_provisional.lock().clone();
+        let response = if let Some(server) = &reliable {
+            match server.prepare(response) {
+                Ok(Some(response)) => response,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    server.fail(e.to_string());
+                    return Err(e);
+                }
+            }
+        } else {
+            response
+        };
 
         let new_state = match response.status_code.kind() {
             StatusCodeKind::Provisional => match response.status_code {
@@ -559,7 +581,11 @@ impl Transaction {
         );
         connection.send(response, self.destination.as_ref()).await?;
         guard.0 = None;
-        self.transition(new_state).map(|_| ())
+        self.transition(new_state)?;
+        if let (Some(server), Some(response)) = (reliable, self.last_response.as_ref()) {
+            server.sent(response);
+        }
+        Ok(())
     }
 
     fn add_ack_cseq_route(&self, dialog_id: &DialogId) -> Option<(DialogId, u32)> {
@@ -839,32 +865,51 @@ impl Transaction {
         mut observer: impl FnMut(&Response) + Send,
     ) -> Option<SipMessage> {
         while let Some(event) = self.tu_receiver.recv().await {
-            match event {
-                TransactionEvent::Received(msg, connection) => {
-                    if let Some(msg) = match msg {
-                        SipMessage::Request(req) => self.on_received_request(req, connection).await,
-                        SipMessage::Response(resp) => {
-                            self.on_received_response(resp, connection, &mut observer)
-                                .await
-                        }
-                    } {
-                        return Some(msg);
-                    }
-                }
-                TransactionEvent::Timer(t) => {
-                    self.on_timer(t).await.ok();
-                }
-                TransactionEvent::Respond(response) => {
-                    self.respond(response).await.ok();
-                }
-                TransactionEvent::Terminate(key) => {
-                    debug!(%key, "received terminate event");
-                    self.invite_reservation.lock().take();
-                    return None;
-                }
+            if let Some(result) = self.dispatch_event_observed(event, &mut observer).await {
+                return result;
             }
         }
         None
+    }
+
+    // Receive from the channel in a cancel-safe select, then finish dispatch
+    // outside the select so a competing application command cannot drop it.
+    pub(crate) async fn dispatch_event(
+        &mut self,
+        event: TransactionEvent,
+    ) -> Option<Option<SipMessage>> {
+        self.dispatch_event_observed(event, &mut |_| {}).await
+    }
+
+    async fn dispatch_event_observed(
+        &mut self,
+        event: TransactionEvent,
+        observer: &mut (impl FnMut(&Response) + Send),
+    ) -> Option<Option<SipMessage>> {
+        match event {
+            TransactionEvent::Received(msg, connection) => {
+                let message = match msg {
+                    SipMessage::Request(req) => self.on_received_request(req, connection).await,
+                    SipMessage::Response(resp) => {
+                        self.on_received_response(resp, connection, observer).await
+                    }
+                };
+                message.map(Some)
+            }
+            TransactionEvent::Timer(t) => {
+                self.on_timer(t).await.ok();
+                None
+            }
+            TransactionEvent::Respond(response) => {
+                self.respond(response).await.ok();
+                None
+            }
+            TransactionEvent::Terminate(key) => {
+                debug!(%key, "received terminate event");
+                self.invite_reservation.lock().take();
+                Some(None)
+            }
+        }
     }
 
     /// Stop request retransmissions while keeping the transaction alive to
@@ -1180,6 +1225,12 @@ impl Transaction {
                 if last.status_code == resp.status_code
                     && last.body == resp.body
                     && last.rseq_value() == resp.rseq_value()
+                    && last.cseq_header().ok() == resp.cseq_header().ok()
+                    && last.call_id_header().ok() == resp.call_id_header().ok()
+                    && last.from_header().and_then(|h| h.tag()).ok()
+                        == resp.from_header().and_then(|h| h.tag()).ok()
+                    && last.to_header().and_then(|h| h.tag()).ok()
+                        == resp.to_header().and_then(|h| h.tag()).ok()
                 {
                     // ignore duplicate response
                     return None;

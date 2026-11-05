@@ -25,8 +25,8 @@ bash scripts/interop/run.sh all                       # all 161; includes 14 kno
 bash scripts/interop/run.sh pjsip                     # 72 PJSUA regression tests
 bash scripts/interop/run.sh pjsip mid_dialog          # 36 mid-dialog PJSUA cases
 bash scripts/interop/run.sh sipp                      # 89 SIPp tests, including known gaps
-bash scripts/interop/run.sh sipp prack                # all 19 PRACK cases, including known gaps
-bash scripts/interop/run.sh regression prack          # 11 passing PRACK regression cases
+bash scripts/interop/run.sh sipp prack                # all 27 PRACK cases
+bash scripts/interop/run.sh regression prack          # 27 passing PRACK regression cases
 bash scripts/interop/run.sh faults                    # 26 UDP loss/delay/race cases
 bash scripts/interop/run.sh known-gaps                # reproduce documented failures
 bash scripts/interop/run.sh pjsip udp_uac_peer_bye     # one test
@@ -79,7 +79,7 @@ may send RTP to loopback discard port 9. No test asserts media delivery or
 quality. RTP/audio quality, scale and downstream application
 behavior (such as CDR/billing) require separate tests.
 
-SIPp's repeated-200 and lost-PRACK-response cases use `-nr` so its UDP duplicate
+SIPp's repeated-200, repeated-183 and lost-PRACK-response cases use `-nr` so its UDP duplicate
 detector does not consume the repeated request before the explicit XML receive
 step. The peer still has to receive the real retransmission from rsipstack.
 Handshake messages/log markers coordinate state checks without timed sleeps.
