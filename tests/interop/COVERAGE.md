@@ -39,7 +39,7 @@ reports the excluded count, and is used by the normal CI job. `known-gaps`
 runs only these probes. Once fixed, move the tests into the regression set
 by removing `known_gap_` from their names and update this document.
 
-The harness commit does not modify the digest parser or other library code.
+The digest parser is unchanged by these tests.
 
 ## Known gap: remote Session-ID UUID lost before BYE
 
@@ -106,8 +106,8 @@ accepting other response codes.
 
 ## Executed matrix
 
-There are 169 external-peer test executions:
-163 regression cases and 6 probes retaining the legacy known-gap names.
+There are 178 external-peer test executions:
+172 regression cases and 6 probes retaining the legacy known-gap names.
 Session-ID and blocked-ACK probes were fixed upstream; their promotion is
 kept in the separate proxy/B2BUA harness change. The lost-PRACK-response and all
 fault-injection cases are UDP-only; the other families run on both transports.
@@ -131,6 +131,7 @@ fault-injection cases are UDP-only; the other families run on both transports.
 | Existing subscription | refresh, incoming presence NOTIFY, application reply, unsubscribe | 2 |
 | UDP fault injection with PJSIP | loss in both directions of INVITE, 200, ACK, BYE, CANCEL and their replies; ACK/BYE delays | 20 |
 | UDP races with SIPp | delayed ACK delivery, wrong-tag BYE during blocked ACK, CANCEL crossing held 200, crossed BYEs | 4 |
+| Re-INVITE bridge | two PJSUA peers for hold/resume, two SIPp peers for offerless SDP, lost answer ACK | 9 |
 | Probes retaining legacy known-gap names | SHA-256; Session-ID; blocked ACK/BYE ordering | 6 |
 
 The lost-487 case is a regression test. An earlier fixture dropped the server

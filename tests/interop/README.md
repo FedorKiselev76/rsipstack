@@ -137,8 +137,8 @@ There are no credentials or external SIP services involved.
 
 ## Controlled UDP faults and replay
 
-`bash scripts/interop/run.sh faults` selects only the 26 fault scenarios.
-`bash scripts/interop/run.sh regression faults` runs their 24 regression cases;
+`bash scripts/interop/run.sh faults` selects the 27 fault scenarios.
+`bash scripts/interop/run.sh regression faults` runs their 25 regression cases;
 `bash scripts/interop/run.sh known-gaps faults` reproduces two known gaps on
 the upstream baseline. Existing local library fixes can change those results.
 The six small fault-engine checks also run under normal `cargo test`; they
