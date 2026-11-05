@@ -21,8 +21,8 @@ brew install cmake pkg-config openssl@3 python
 From the repository root:
 
 ```sh
-bash scripts/interop/run.sh regression                # supported baseline (169 tests)
-bash scripts/interop/run.sh all                       # all 183; includes 14 known-gap probes
+bash scripts/interop/run.sh regression                # supported baseline (173 tests)
+bash scripts/interop/run.sh all                       # all 183; includes 10 known-gap probes
 bash scripts/interop/run.sh pjsip                     # 72 PJSUA regression tests
 bash scripts/interop/run.sh pjsip mid_dialog          # 36 mid-dialog PJSUA cases
 bash scripts/interop/run.sh sipp                      # 89 SIPp tests, including known gaps
@@ -64,7 +64,8 @@ See [COVERAGE.md](COVERAGE.md) for the complete matrix, reproducible known gaps,
 and the features this suite does not exercise. The default (`all`) and `sipp`
 include known-gap probes and currently **return nonzero**. `regression`
 explicitly reports and excludes them; it does not change their assertions.
-The documented counts describe the baseline commit; results can differ when
+The documented counts describe upstream baseline `004f607` plus these application
+tests; results can differ when
 run against another revision or with uncommitted application changes.
 
 PJSUA checks calls in both directions, UDP loss/retransmission, hold/resume and UPDATE initiated by
@@ -185,9 +186,9 @@ crash recovery remain outside this initial matrix.
 ## Controlled UDP faults and replay
 
 `bash scripts/interop/run.sh faults` selects only the 26 fault scenarios.
-`bash scripts/interop/run.sh regression faults` runs their 24 regression cases;
-`bash scripts/interop/run.sh known-gaps faults` reproduces two known gaps on
-the upstream baseline. Existing local library fixes can change those results.
+All 26 are regression cases on upstream `004f607`, including the previously
+failing blocked-ACK cases fixed by PR #235. A `known-gaps faults` selection now
+matches no tests and fails explicitly rather than reporting a misleading pass.
 The six small fault-engine checks also run under normal `cargo test`; they
 need loopback sockets but no external peer binaries or downloads.
 
