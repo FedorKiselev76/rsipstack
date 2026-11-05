@@ -4,6 +4,22 @@ This harness is a growing collection of real-process interoperability tests,
 not a certification of complete SIP conformance. A passing case covers only
 the exchange and assertions stated for that case.
 
+## Established-dialog re-INVITE bridge
+
+`pjsip bridge` adds four UDP/TCP cases with two PJSUA processes: hold and resume
+from either dialog leg, independent dialog identifiers and CSeq, SDP relay,
+ACK on both legs, and teardown. `sipp bridge` adds four UDP/TCP offerless cases
+plus one UDP ACK-loss case. SIPp supplies an offer in 200, waits for an explicit
+driver handshake before returning the answer in ACK, and checks the answer
+again after repeating the 200. The loss case drops the first SDP ACK at the
+UDP socket boundary and requires a retransmitted ACK with identical contents.
+
+Library wire tests additionally cover 488, CANCEL and late 200, simultaneous
+re-INVITEs, missing ACK and rejecting answers with multiple media streams.
+They complement the external cases; raw UDP tests are not independent stack
+implementations. Initial-call bridging, reliable provisional offer/answer,
+session timers and media negotiation remain separate responsibilities.
+
 ## Known gap: standard SHA-256 digest challenge
 
 Reproduce with `bash scripts/interop/run.sh known-gaps` (both UDP and TCP),
