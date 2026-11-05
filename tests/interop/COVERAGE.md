@@ -86,9 +86,10 @@ accepting other response codes.
 
 ## Executed matrix
 
-There are 161 external-peer test executions:
-147 regression cases and 14 known-gap probes. The lost-PRACK-response and all
-fault-injection cases are UDP-only; the other families run on both transports.
+There are 183 external-peer test executions:
+169 regression cases and 14 known-gap probes. The lost-PRACK-response,
+application lost-BYE-response and all fault-injection cases are UDP-only;
+the other families run on both transports.
 
 | Area | Exchanges / assertions | Executions |
 | --- | --- | ---: |
@@ -109,6 +110,8 @@ fault-injection cases are UDP-only; the other families run on both transports.
 | Existing subscription | refresh, incoming presence NOTIFY, application reply, unsubscribe | 2 |
 | UDP fault injection with PJSIP | loss in both directions of INVITE, 200, ACK, BYE, CANCEL and their replies; ACK/BYE delays | 20 |
 | UDP races with SIPp | delayed ACK delivery, wrong-tag BYE during blocked ACK, CANCEL crossing held 200, crossed BYEs | 4 |
+| Standalone proxy | two PJSUA peers; caller/callee BYE, 486, CANCEL; SIPp late 200 and lost BYE response; preserved dialog identity and Via/Record-Route forwarding | 11 |
+| Standalone B2BUA | two independent dialogs; caller/callee BYE, 486, CANCEL; SIPp late 200 and lost BYE response; independent identifiers and both-leg cleanup | 11 |
 | Known-gap probes | SHA-256; Session-ID; PRACK; blocked ACK/BYE ordering | 14 |
 
 The lost-487 case is a regression test. An earlier fixture dropped the server
@@ -141,8 +144,10 @@ See [RFC 3262 sections 3 and 4](https://www.rfc-editor.org/rfc/rfc3262.html#sect
 The subscription fixture starts with an existing dialog's tags. It checks the
 public subscription API and incoming NOTIFY dispatch; it does not claim to
 test initial SUBSCRIBE establishment or the final terminated NOTIFY exchange.
-The route test uses a single local SIPp endpoint as the next hop; it checks
-the learned Route headers, not a multi-proxy deployment.
+The direct route test uses a single local SIPp endpoint as the next hop; it
+checks learned Route headers. The standalone proxy cases add one real proxy
+process between two independent peers, but do not cover a multi-proxy chain.
+See [the application contract and limitations](README.md#standalone-proxy-and-b2bua).
 
 ## Remaining coverage
 
@@ -157,6 +162,7 @@ features. No finite suite covers every SIP message sequence or peer behavior.
 | Transactions | multi-packet loss bursts, long timer exhaustion, crash/restart recovery |
 | Authentication | multiple challenges, auth-int, sess algorithms, SHA-512/256, rejected credentials |
 | Routing | strict routes, several proxies, redirects, Path/Outbound flows |
+| Standalone applications | proxy-specific 2xx retransmission policy, forking, session modification, PRACK, authentication, disconnect recovery and media relay |
 | Event packages | initial SUBSCRIBE/NOTIFY races, terminal NOTIFY, PUBLISH, REFER/Replaces |
 | Session extensions | session timers, full Session-ID transfer/conference flows |
 | Media and scale | RTP/SRTP, codecs, ICE, DTMF media events, concurrency and soak/load tests |
