@@ -12,7 +12,7 @@
 //! [`ClientInviteDialog`]: crate::dialog::client_dialog::ClientInviteDialog
 
 use super::dialog::DialogInner;
-use super::dialog::InitialInviteAck;
+use super::dialog::InviteAck;
 use super::dialog::{Dialog, DialogInnerRef, DialogState, TerminatedReason, TransactionHandle};
 use super::subscription::{ClientSubscriptionDialog, ServerSubscriptionDialog};
 use super::DialogId;
@@ -52,7 +52,7 @@ pub struct InviteDialog {
 
 // Wake local teardown if the INVITE driver is dropped during ACK. It must
 // report an interrupted ACK instead of waiting forever or sending BYE first.
-struct InitialAckGuard(Arc<InitialInviteAck>);
+struct InitialAckGuard(Arc<InviteAck>);
 
 impl Drop for InitialAckGuard {
     fn drop(&mut self) {
@@ -182,6 +182,13 @@ impl InviteDialog {
         if self.inner.is_terminated() || self.inner.is_confirmed() {
             return Ok(());
         }
+        {
+            let state = self.inner.state.lock();
+            if state.is_terminated() || state.is_confirmed() {
+                return Ok(());
+            }
+            self.inner.record_local_termination();
+        }
         debug!(id = %self.id(), ?code, ?reason, "rejecting dialog");
         let headers = reason.map(|reason| vec![Header::Reason(reason.into())]);
         let resp = self.inner.make_response(
@@ -258,11 +265,13 @@ impl InviteDialog {
             let state = self.inner.state.lock();
             match *state {
                 DialogState::Calling(_) => {
+                    self.inner.record_local_termination();
                     self.inner.cancel_requested.store(true, Ordering::SeqCst);
                     self.inner.cancel_deferred.store(true, Ordering::SeqCst);
                     return Ok(());
                 }
                 DialogState::Trying(_) | DialogState::Early(_, _) => {
+                    self.inner.record_local_termination();
                     self.inner.cancel_requested.store(true, Ordering::SeqCst);
                 }
                 _ => return Ok(()),
@@ -366,6 +375,7 @@ impl InviteDialog {
         self.inner.reserve_invite(tx)?;
         self.inner.transition(DialogState::Calling(self.id()));
         let mut auth = AuthRetry::new();
+        tx.track_receipt_times(self.inner.lifecycle.lock().sender.is_some());
         tx.send().await?;
         // Record the flow the INVITE actually went out on, so later
         // in-dialog requests (BYE / re-INVITE / INFO) reuse it instead of
@@ -374,22 +384,26 @@ impl InviteDialog {
         let mut dialog_id = self.id();
         let mut final_response = None;
         loop {
-            let ack = InitialInviteAck::new();
+            let ack = InviteAck::new();
             let _ack_guard = InitialAckGuard(ack.clone());
             let mut established = Ok(false);
             let msg = tx
-                .receive_with_response_observer(|resp| {
+                .receive_with_response_observer(|resp, received_at| {
                     let peer_uuid = resp.session_id_header().and_then(|s| s.local_uuid());
                     self.inner.observe_peer_session_uuid(peer_uuid);
                     if resp.status_code.kind() == StatusCodeKind::Successful {
                         self.inner.initial_ack.lock().replace(ack.clone());
-                        established = self.establish_from_2xx(resp, &mut register);
+                        established = self.establish_from_2xx(resp, received_at, &mut register);
                     }
                 })
                 .await;
             ack.finish();
             let cancelled = established?;
             let Some(msg) = msg else { break };
+            if matches!(&msg, SipMessage::Response(r) if r.status_code.kind() != StatusCodeKind::Provisional)
+            {
+                tx.track_receipt_times(false);
+            }
             match msg {
                 SipMessage::Request(_) => {}
                 SipMessage::Response(resp) => {
@@ -435,6 +449,7 @@ impl InviteDialog {
                             )
                             .await?;
                             self.inner.reserve_invite(tx)?;
+                            tx.track_receipt_times(self.inner.lifecycle.lock().sender.is_some());
                             tx.send().await?;
                             self.inner.set_server_connection(tx.connection.clone());
                             self.inner.update_remote_tag("").ok();
@@ -497,6 +512,7 @@ impl InviteDialog {
     fn establish_from_2xx(
         &self,
         resp: &Response,
+        received_at: super::lifecycle::LifecycleTime,
         register: &mut impl FnMut(&DialogId),
     ) -> Result<bool> {
         if let Some(tag) = resp.to_header()?.tag()? {
@@ -507,7 +523,7 @@ impl InviteDialog {
         let confirmed = DialogState::Confirmed(id.clone(), resp.clone());
         Ok(self
             .inner
-            .confirm_unless_cancelled(confirmed, || register(&id)))
+            .confirm_unless_cancelled(confirmed, received_at, || register(&id)))
     }
 
     /// Take the route set, Contact and remote target from a 2xx to the INVITE.
@@ -1001,6 +1017,10 @@ impl InviteDialog {
     }
 
     async fn handle_bye(&mut self, tx: &mut Transaction) -> Result<()> {
+        self.inner.record_remote_bye(
+            tx.original_received_at
+                .unwrap_or_else(super::lifecycle::LifecycleTime::now),
+        );
         debug!(id = %self.id(), uri = %tx.original.uri, "received bye");
         let reason = match self.role() {
             TransactionRole::Server => TerminatedReason::UacBye,
@@ -1115,42 +1135,11 @@ impl InviteDialog {
     }
 
     async fn handle_reinvite(&mut self, tx: &mut Transaction) -> Result<()> {
-        debug!(id = %self.id(), "received re-invite {}", tx.original.uri);
-        let (handle, rx) = TransactionHandle::new();
-        self.inner
-            .transition(DialogState::Updated(self.id(), tx.original.clone(), handle));
-
-        self.inner.process_transaction_handle(tx, rx).await?;
-        let answered_2xx = tx
-            .last_response
-            .as_ref()
-            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
-        let mut acked = false;
-
-        while let Some(msg) = tx.receive().await {
-            if let SipMessage::Request(req) = msg {
-                if req.method == Method::Ack {
-                    debug!(id = %self.id(), "received ack for re-invite {}", req.uri);
-                    self.inner.remote_ack.lock().replace(req);
-                    self.inner.transition(DialogState::Confirmed(
-                        self.id(),
-                        tx.last_response.clone().unwrap_or_default(),
-                    ));
-                    acked = true;
-                    break;
-                }
-            }
-        }
-        // A matching ACK ends the Accepted transaction; `acked` keeps the
-        // timeout path (no ACK within 64*T1) from firing on a confirmed
-        // re-INVITE.
-        self.inner
-            .end_session_without_ack(tx, answered_2xx && !acked)
-            .await;
-        Ok(())
+        self.inner.process_reinvite(tx, true).await
     }
 
     async fn handle_invite(&mut self, tx: &mut Transaction) -> Result<()> {
+        *tx.initial_dialog.lock() = Some(Arc::downgrade(&self.inner));
         let handle_loop = async {
             if matches!(tx.original.method, Method::Invite)
                 && self.inner.transition_if_calling()

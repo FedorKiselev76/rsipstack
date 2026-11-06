@@ -11,8 +11,10 @@ pub mod dialog;
 pub mod dialog_layer;
 pub mod invitation;
 pub mod invite_dialog;
+pub mod lifecycle;
 pub mod publication;
 pub mod registration;
+pub mod reinvite;
 pub mod server_dialog;
 pub mod subscription;
 
