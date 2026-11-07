@@ -121,6 +121,7 @@ pub struct EndpointInner {
     pub(crate) finished_invite_acks: RwMap<TransactionKey, super::ack_cache::AckCache>,
     pub transactions: RwMap<TransactionKey, TransactionEventSender>,
     pub(crate) record_receipt_times: core::sync::atomic::AtomicBool,
+    pub(crate) proxy_ack_dispatch: core::sync::atomic::AtomicBool,
     pub(crate) receipt_times: RwMap<TransactionKey, Arc<super::receipt::ReceiptTimes>>,
     pub(crate) legacy_ack_tags: RwMap<TransactionKey, Option<String>>,
     pub waiting_ack: RwMap<DialogId, TransactionKey>,
@@ -128,6 +129,7 @@ pub struct EndpointInner {
     /// and INVITE CSeq number: `waiting_ack` holds only a dialog's latest
     /// INVITE, and the ACK of an earlier one can arrive after it (§13.2.2.4).
     pub(crate) waiting_ack_cseq: RwMap<(DialogId, u32), TransactionKey>,
+    pub(crate) pending_ack_dispatch: RwMap<(DialogId, TransactionKey), CancellationToken>,
     incoming_sender: TransactionSender,
     incoming_receiver: Mutex<Option<TransactionReceiver>>,
     cancel_token: CancellationToken,
@@ -246,12 +248,14 @@ impl EndpointInner {
             transport_layer,
             transactions: RwMap::<TransactionKey, TransactionEventSender>::new(),
             record_receipt_times: core::sync::atomic::AtomicBool::new(false),
+            proxy_ack_dispatch: core::sync::atomic::AtomicBool::new(false),
             receipt_times: RwMap::new(),
             legacy_ack_tags: RwMap::new(),
             finished_transactions: RwMap::<TransactionKey, Option<SipMessage>>::new(),
             finished_invite_acks: RwMap::new(),
             waiting_ack: RwMap::<DialogId, TransactionKey>::new(),
             waiting_ack_cseq: RwMap::new(),
+            pending_ack_dispatch: RwMap::new(),
             timer_interval: timer_interval.unwrap_or(Duration::from_millis(20)),
             cancel_token,
             incoming_sender,
@@ -387,6 +391,7 @@ impl EndpointInner {
             .record_receipt_times
             .load(core::sync::atomic::Ordering::Relaxed)
             .then(crate::dialog::lifecycle::LifecycleTime::now);
+        let mut ack_dialog = None;
         let mut key = match &msg {
             SipMessage::Request(req) => {
                 TransactionKey::from_request(req, super::key::TransactionRole::Server)?
@@ -411,9 +416,14 @@ impl EndpointInner {
                             req.cseq_header()
                                 .and_then(|c| c.seq())
                                 .ok()
-                                .and_then(|seq| self.waiting_ack_cseq.get(&(id, seq)))
+                                .and_then(|seq| {
+                                    self.waiting_ack_cseq
+                                        .get(&(id.clone(), seq))
+                                        .map(|key| (id, key))
+                                })
                         });
-                    if let Some(accepted) = accepted {
+                    if let Some((id, accepted)) = accepted {
+                        ack_dialog = Some(id);
                         key = accepted;
                     } else if key.is_legacy() {
                         let candidate = self.legacy_ack_tags.with(|m| {
@@ -422,10 +432,14 @@ impl EndpointInner {
                                     .then(|| candidate.clone())
                             })
                         });
-                        let Some(candidate) = candidate else {
+                        if let Some(candidate) = candidate {
+                            key = candidate;
+                        } else if !self
+                            .proxy_ack_dispatch
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                        {
                             return Ok(());
-                        };
-                        key = candidate;
+                        }
                     }
                 }
                 // check is the termination of an existing transaction
@@ -582,11 +596,26 @@ impl EndpointInner {
         };
 
         if let Some(tu) = self.transactions.get(&key) {
+            // Preserve ACK-before-next-request order without blocking the
+            // endpoint on a dialog handler or storage callback.
+            let ack_key = ack_dialog.map(|id| (id, key.clone()));
+            if let Some(ack_key) = &ack_key {
+                self.pending_ack_dispatch.with_mut(|m| {
+                    m.entry(ack_key.clone())
+                        .or_insert_with(CancellationToken::new);
+                });
+            }
             if let (Some(time), Some(receipts)) = (received_at, self.receipt_times.get(&key)) {
                 receipts.record(&msg, time);
             }
-            tu.send(TransactionEvent::Received(msg, Some(connection)))
-                .map_err(|e| Error::TransactionError(e.to_string(), key))?;
+            if let Err(error) = tu.send(TransactionEvent::Received(msg, Some(connection))) {
+                if let Some(ack_key) = ack_key {
+                    if let Some(token) = self.pending_ack_dispatch.remove(&ack_key) {
+                        token.cancel();
+                    }
+                }
+                return Err(Error::TransactionError(error.to_string(), key));
+            }
             return Ok(());
         }
         // if the transaction is not exist, create a new transaction
@@ -605,12 +634,21 @@ impl EndpointInner {
                 let status = crate::sip::StatusCode::CallTransactionDoesNotExist;
                 return self.reply_cancel(&request, status, None, &connection).await;
             }
-            crate::sip::Method::Ack => return Ok(()),
+            crate::sip::Method::Ack
+                if !self
+                    .proxy_ack_dispatch
+                    .load(core::sync::atomic::Ordering::Relaxed) =>
+            {
+                return Ok(())
+            }
             _ => {}
         }
 
         let mut tx =
             Transaction::new_server(key.clone(), request.clone(), self.clone(), Some(connection));
+        if request.method == crate::sip::Method::Ack {
+            tx.mark_stateless_ack();
+        }
         tx.original_received_at = received_at;
 
         self.incoming_sender.send(tx).ok();
@@ -719,6 +757,24 @@ impl EndpointInner {
 
     pub fn get_addrs(&self) -> Vec<SipAddr> {
         self.transport_layer.get_addrs()
+    }
+
+    pub(crate) async fn send_stateless(
+        &self,
+        mut request: crate::sip::Request,
+        destination: SipAddr,
+    ) -> Result<()> {
+        request
+            .headers
+            .unique_push(crate::sip::Header::ContentLength(
+                (request.body.len() as u32).into(),
+            ));
+        let (connection, destination) = self.transport_layer.lookup(&destination, None).await?;
+        let message = match &self.message_inspector {
+            Some(inspector) => inspector.before_send(request.into(), Some(&destination)),
+            None => request.into(),
+        };
+        connection.send(message, Some(&destination)).await
     }
 
     pub fn get_record_route(&self) -> Result<crate::sip::typed::RecordRoute> {

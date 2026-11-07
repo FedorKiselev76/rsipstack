@@ -251,3 +251,25 @@ Two separately selected UDP variants run parallel calls and repeated automatic
 UPDATE/re-INVITE refreshes against SIPp with one lost response per round. They
 check registry/transaction cleanup, endpoint/layer release, runtime task counts,
 and post-warmup RSS growth. See [SOAK.md](SOAK.md) for bounds, artifacts and limits.
+
+### Managed event publication
+
+The `publication` filter covers create, refresh, modify and removal through the
+managed publication API against SIPp over UDP and TCP. It checks ETag rotation,
+empty refresh/removal bodies and that response Record-Route/Contact do not alter
+PUBLISH routing. These cases do not claim automatic renewal or durable publication
+store recovery.
+
+
+## Managed standalone event usages
+
+`bash scripts/interop/run.sh sipp managed_subscription` covers real initial
+SUBSCRIBE, NOTIFY before the response, refresh, and unsubscription with final
+NOTIFY over UDP and TCP. The older `subscription_refresh` cases still exercise
+legacy established-dialog behavior. Public API regressions additionally cover
+forked tags, Event matching, CSeq admission, strict routing, authentication,
+Timer N, notifier expiry, dropped responders and registry cleanup.
+
+`bash scripts/interop/run.sh sipp publication` covers managed PUBLISH create,
+refresh, modify, ETag rotation and removal over UDP/TCP. Publication does not
+create a dialog. Event-package policy and storage remain application-owned.

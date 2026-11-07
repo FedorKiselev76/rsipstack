@@ -5,23 +5,83 @@ use crate::{
     Error, Result,
 };
 
+#[cfg(not(rsipstack_no_legacy))]
+mod legacy;
+pub mod v2managed;
+
 pub mod authenticate;
+#[cfg(not(rsipstack_no_legacy))]
 pub mod client_dialog;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "core/dialog.rs"]
 pub mod dialog;
+#[cfg(rsipstack_no_legacy)]
+#[path = "core/dialog.rs"]
+pub(crate) mod dialog;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "core/dialog_layer.rs"]
 pub mod dialog_layer;
+#[cfg(rsipstack_no_legacy)]
+#[path = "core/dialog_layer.rs"]
+pub(crate) mod dialog_layer;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "operations/incoming.rs"]
+pub mod incoming;
+#[cfg(rsipstack_no_legacy)]
+#[path = "operations/incoming.rs"]
+pub(crate) mod incoming;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "operations/initial_operation.rs"]
+pub mod initial_operation;
+#[cfg(rsipstack_no_legacy)]
+#[path = "operations/initial_operation.rs"]
+pub(crate) mod initial_operation;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "core/invitation.rs"]
 pub mod invitation;
+#[cfg(rsipstack_no_legacy)]
+#[path = "core/invitation.rs"]
+pub(crate) mod invitation;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "core/invite_dialog.rs"]
 pub mod invite_dialog;
+#[cfg(rsipstack_no_legacy)]
+#[path = "core/invite_dialog.rs"]
+pub(crate) mod invite_dialog;
 pub mod lifecycle;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "operations/operation.rs"]
+pub mod operation;
+#[cfg(rsipstack_no_legacy)]
+#[path = "operations/operation.rs"]
+pub(crate) mod operation;
 pub mod persistence;
 pub mod publication;
+pub mod recovery;
 pub mod registration;
+#[path = "core/reinvite.rs"]
 pub mod reinvite;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "core/reinvite_bridge.rs"]
 pub mod reinvite_bridge;
+#[cfg(rsipstack_no_legacy)]
+#[path = "core/reinvite_bridge.rs"]
+pub(crate) mod reinvite_bridge;
 pub mod reliable;
+#[path = "operations/response_operation.rs"]
+pub mod response_operation;
+#[cfg(not(rsipstack_no_legacy))]
 pub mod server_dialog;
+#[path = "core/session_timer.rs"]
 pub mod session_timer;
 pub mod snapshot;
 pub mod subscription;
+#[cfg(not(rsipstack_no_legacy))]
+#[path = "operations/termination.rs"]
+pub mod termination;
+#[cfg(rsipstack_no_legacy)]
+#[path = "operations/termination.rs"]
+pub(crate) mod termination;
 
 #[cfg(test)]
 mod tests;

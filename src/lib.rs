@@ -286,6 +286,7 @@ pub use crate::error::Error;
 pub mod dialog;
 pub mod error;
 pub mod platform;
+pub mod proxy;
 pub mod resolver;
 pub mod transaction;
 pub mod transport;

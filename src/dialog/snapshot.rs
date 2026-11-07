@@ -209,6 +209,8 @@ pub struct DialogPendingState {
     pub remote_invite_awaiting_ack: bool,
     pub initial_ack: bool,
     pub negotiations: u32,
+    /// Prepared or running owned operations, including non-INVITE requests.
+    pub operations: u32,
     pub local_termination: bool,
     pub remote_termination: bool,
 }
@@ -220,6 +222,7 @@ impl DialogPendingState {
             && !self.remote_invite_awaiting_ack
             && !self.initial_ack
             && self.negotiations == 0
+            && self.operations == 0
             && !self.local_termination
             && !self.remote_termination
     }

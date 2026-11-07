@@ -115,6 +115,7 @@ pub(crate) struct LifecycleState {
     pub pending_initial_ack: bool,
     pub pending_remote_bye: bool,
     pub negotiations: u32,
+    pub operations: u32,
     pub facts: alloc::vec::Vec<super::snapshot::DialogLifecycleRecord>,
     pub defer_delivery: bool,
     pub undelivered: alloc::vec::Vec<DialogLifecycleEvent>,

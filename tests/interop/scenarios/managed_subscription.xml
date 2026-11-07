@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<scenario name="Managed initial subscription with early NOTIFY and final notification">
+  <recv request="SUBSCRIBE"><action>
+    <ereg regexp="tag=([^; &gt;]+)" search_in="hdr" header="From:" check_it="true" assign_to="_,from_tag"/>
+    <ereg regexp="presence" search_in="hdr" header="Event:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <nop><action>
+    <assignstr assign_to="call_id" value="[last_Call-ID:]"/>
+    <assignstr assign_to="via" value="[last_Via:]"/>
+    <assignstr assign_to="from" value="[last_From:]"/>
+    <assignstr assign_to="to" value="[last_To:];tag=sipp-subscription"/>
+    <assignstr assign_to="cseq" value="[last_CSeq:]"/>
+  </action></nop>
+  <send><![CDATA[
+NOTIFY [rsip_uri] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=z9hG4bK-early-notify-[pid]
+From: <[sipp_uri]>;tag=sipp-subscription
+To: <[rsip_uri]>;tag=[$from_tag]
+[$call_id]
+CSeq: 1 NOTIFY
+Max-Forwards: 70
+Event: presence
+Subscription-State: active;expires=60
+Contact: <[sipp_uri]>
+Content-Type: application/pidf+xml
+Content-Length: [len]
+
+<presence><tuple><status><basic>open</basic></status></tuple></presence>
+]]></send>
+  <recv response="200"/>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[$via]
+[$from]
+[$to]
+[$call_id]
+[$cseq]
+Contact: <[sipp_uri]>
+Expires: 60
+Content-Length: 0
+
+]]></send>
+  <recv request="SUBSCRIBE"><action>
+    <ereg regexp="^ *30" search_in="hdr" header="Expires:" check_it="true" assign_to="_"/>
+    <ereg regexp="tag=sipp-subscription" search_in="hdr" header="To:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <[sipp_uri]>
+Expires: 30
+Content-Length: 0
+
+]]></send>
+  <send><![CDATA[
+NOTIFY [rsip_uri] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=z9hG4bK-refresh-notify-[pid]
+From: <[sipp_uri]>;tag=sipp-subscription
+To: <[rsip_uri]>;tag=[$from_tag]
+[$call_id]
+CSeq: 2 NOTIFY
+Max-Forwards: 70
+Event: presence
+Subscription-State: active;expires=30
+Contact: <[sipp_uri]>
+Content-Length: 0
+
+]]></send>
+  <recv response="200"/>
+  <recv request="SUBSCRIBE"><action>
+    <ereg regexp="^ *0" search_in="hdr" header="Expires:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <[sipp_uri]>
+Expires: 0
+Content-Length: 0
+
+]]></send>
+  <send><![CDATA[
+NOTIFY [rsip_uri] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=z9hG4bK-final-notify-[pid]
+From: <[sipp_uri]>;tag=sipp-subscription
+To: <[rsip_uri]>;tag=[$from_tag]
+[$call_id]
+CSeq: 3 NOTIFY
+Max-Forwards: 70
+Event: presence
+Subscription-State: terminated;reason=timeout
+Contact: <[sipp_uri]>
+Content-Length: 0
+
+]]></send>
+  <recv response="200"/>
+</scenario>

@@ -363,6 +363,9 @@ pub async fn handle_client_authenticate(
     );
     new_tx.destination = tx.destination.clone();
     new_tx.dialog_route_set = tx.dialog_route_set.clone();
+    new_tx.operation = tx.operation.clone();
+    new_tx.defer_success_ack = tx.defer_success_ack;
+    new_tx.force_success_ack = tx.force_success_ack;
     Ok(new_tx)
 }
 

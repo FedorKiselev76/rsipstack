@@ -4,6 +4,25 @@
 
 A RFC 3261/3262 compliant SIP stack written in Rust. The goal of this project is to provide a high-performance, reliable, and easy-to-use SIP stack that can be used in various scenarios.
 
+## Experimental managed dialog API
+
+This branch contains the opt-in [managed dialog API](MANAGED-DIALOG-API.md)
+alongside the existing dialog API. It also includes the [stateful proxy API](PROXY-API-EXPERIMENT.md).
+The [migration guide](MIGRATING-0.9.md) covers snapshot compatibility.
+
+Run the signaling example against its built-in loopback peer:
+
+```sh
+cargo run --example dialog_operations
+```
+
+To see the difference between accepting a response, sending it, and receiving
+its matching ACK, run the incoming INVITE regression:
+
+```sh
+cargo test --test dialog_setup_operations uas_receipt_separates_send_from_matching_ack_and_survives_dropped_waiter -- --exact
+```
+
 ## Features
 
 - **RFC 3261/3262 Compliant**: Full compliance with SIP specification

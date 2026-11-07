@@ -20,6 +20,13 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  dialog-api-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check managed API without legacy adapters
+        run: bash scripts/check-dialog-api-boundary.sh
+
   lint:
     name: Rustfmt / Clippy
     runs-on: ubuntu-latest

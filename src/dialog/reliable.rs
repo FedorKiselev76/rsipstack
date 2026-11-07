@@ -5,6 +5,7 @@
 //! RAck, transactions, retransmissions and final-response ordering.
 use super::{
     dialog::{DialogInner, DialogState, TerminatedReason},
+    response_operation::ResponseSubmission,
     DialogId,
 };
 use crate::platform::{self, sync::Mutex, CancellationToken};
@@ -427,8 +428,8 @@ struct Outstanding {
 struct ServerState {
     next_rseq: u32,
     outstanding: Option<Outstanding>,
-    queue: Vec<Response>,
-    final_response: Option<Response>,
+    queue: Vec<ResponseSubmission>,
+    final_response: Option<ResponseSubmission>,
     final_sent: bool,
     first_answer: Option<Vec<u8>>,
     offer_answer_complete: bool,
@@ -469,7 +470,10 @@ impl ReliableServer {
     }
 
     /// Called by the owning transaction, never while a network send is in flight.
-    pub(crate) fn prepare(&self, mut response: Response) -> Result<Option<Response>> {
+    pub(crate) fn prepare_submission(
+        &self,
+        mut response: ResponseSubmission,
+    ) -> Result<Option<ResponseSubmission>> {
         let mut s = self.state.lock();
         if response.status_code == StatusCode::Trying {
             response
@@ -484,18 +488,27 @@ impl ReliableServer {
             if s.final_sent {
                 return Ok(Some(response));
             }
+            if response.producer.is_some() && s.final_response.is_some() {
+                return Err(error("final INVITE response already queued"));
+            }
             if response.status_code.kind() == StatusCodeKind::Successful
                 && s.outstanding
                     .as_ref()
                     .is_some_and(|o| has_sdp(&o.response, &o.response.body) || o.processing)
             {
                 s.final_response = Some(response);
-                s.queue.clear();
+                for queued in s.queue.drain(..) {
+                    queued.supersede();
+                }
                 return Ok(None);
             }
             s.final_sent = true;
-            s.queue.clear();
-            s.final_response = None;
+            for queued in s.queue.drain(..) {
+                queued.supersede();
+            }
+            if let Some(queued) = s.final_response.take() {
+                queued.supersede();
+            }
             if let Some(o) = &s.outstanding {
                 o.cancel.cancel();
             }
@@ -514,7 +527,7 @@ impl ReliableServer {
             return Ok(s
                 .outstanding
                 .as_ref()
-                .filter(|o| !o.processing && o.response == response)
+                .filter(|o| !o.processing && o.response == response.response)
                 .map(|_| response));
         }
         if s.final_response.is_some() {
@@ -527,7 +540,7 @@ impl ReliableServer {
             s.queue.push(response);
             return Ok(None);
         }
-        let sdp = has_sdp(&response, &response.body);
+        let sdp = has_sdp(&response.response, &response.body);
         let kind = if has_sdp(&self.request, &self.request.body) {
             if sdp {
                 if let Some(answer) = &s.first_answer {
@@ -563,12 +576,12 @@ impl ReliableServer {
             return Err(error("RSeq space exhausted"));
         }
         s.next_rseq = rseq.checked_add(1).unwrap_or(0);
-        add_option(&mut response, "Require", "100rel");
+        add_option(&mut response.response, "Require", "100rel");
         response
             .headers
             .unique_push(Header::RSeq(rseq.to_string().into()));
         s.outstanding = Some(Outstanding {
-            response: response.clone(),
+            response: response.response.clone(),
             kind,
             cancel: CancellationToken::new(),
             timer_started: false,
@@ -714,8 +727,12 @@ impl ReliableServer {
                 return;
             }
             s.outstanding = None;
-            s.queue.clear();
-            s.final_response = None;
+            for queued in s.queue.drain(..) {
+                queued.supersede();
+            }
+            if let Some(queued) = s.final_response.take() {
+                queued.supersede();
+            }
         }
         let response = owner.make_response(&self.request, StatusCode::ServerTimeOut, None, None);
         self.sender.send(TransactionEvent::Respond(response)).ok();
@@ -735,8 +752,12 @@ impl ReliableServer {
             if let Some(outstanding) = state.outstanding.take() {
                 outstanding.cancel.cancel();
             }
-            state.queue.clear();
-            state.final_response = None;
+            for queued in state.queue.drain(..) {
+                queued.supersede();
+            }
+            if let Some(queued) = state.final_response.take() {
+                queued.supersede();
+            }
             !state.final_sent
         };
         if reject {
@@ -860,7 +881,7 @@ impl ReliableServer {
             }
         };
         if let Some(response) = next {
-            self.sender.send(TransactionEvent::Respond(response))?;
+            self.sender.send(response.event())?;
         }
         Ok(())
     }

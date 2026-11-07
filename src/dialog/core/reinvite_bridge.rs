@@ -42,6 +42,8 @@
 //! # Ok(()) }
 //! ```
 
+#![deny(deprecated)]
+
 use super::{
     dialog::TransactionHandle,
     invite_dialog::InviteDialog,
@@ -268,7 +270,9 @@ impl Inner {
             // CANCEL can win before the application dispatches Updated. The
             // default dialog handler may already have sent 487; either way,
             // do not start a new negotiation on the other leg.
-            handle.reply(StatusCode::RequestTerminated).await.ok();
+            reply(&handle, StatusCode::RequestTerminated, None, None)
+                .await
+                .ok();
             return Ok(StatusCode::RequestTerminated);
         }
         let cancellation = self.shutdown.child_token();
@@ -299,14 +303,6 @@ impl Inner {
         } else {
             None
         };
-        let outgoing = match destination
-            .prepare_reinvite(payload.as_ref().map(body_headers), payload.map(|p| p.body))
-        {
-            Ok(request) => request,
-            Err(_) => {
-                return reply(&handle, StatusCode::CallTransactionDoesNotExist, None, None).await
-            }
-        };
         let answered = Arc::new(AtomicBool::new(false));
         let handler = (!offered).then(|| {
             Arc::new(RelayAnswer {
@@ -319,16 +315,27 @@ impl Inner {
         });
         #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
         let (provisionals, mut progress) = mpsc::unbounded_channel();
-        let mut pending = core::pin::pin!(destination.send_reinvite(
-            outgoing,
+        let operation = match destination.admit_reinvite(
+            payload.as_ref().map(body_headers),
+            payload.map(|p| p.body),
             ReinviteOptions {
                 cancellation: cancellation.clone(),
                 answer_handler: handler,
                 provisional_responses: Some(provisionals),
+            },
+        ) {
+            Ok(operation) => operation,
+            Err(super::operation::AdmissionError::NegotiationInProgress) => {
+                return reply(&handle, StatusCode::RequestPending, None, None).await
             }
-        ));
+            Err(error) => {
+                reply(&handle, StatusCode::BadGateway, None, None).await?;
+                return Err(crate::Error::Error(error.to_string()));
+            }
+        };
+        let mut pending = core::pin::pin!(operation.wait());
         let mut relay_failure = None;
-        let result = loop {
+        let completion = loop {
             match select2(&mut pending, core::pin::pin!(progress.recv())).await {
                 Either::A(result) => break result,
                 Either::B(Some(response)) => {
@@ -376,6 +383,19 @@ impl Inner {
                 Either::B(None) => break pending.await,
             }
         };
+        // A response remains observable even when its ACK or durable completion
+        // failed. A successful far leg still needs cleanup in that case.
+        if completion.signaling_result().is_err()
+            && completion
+                .response()
+                .is_some_and(|r| r.status_code.kind() == StatusCodeKind::Successful)
+        {
+            terminate(destination).await;
+        }
+        let result = completion
+            .signaling_result()
+            .map_err(|e| error(&e.to_string()))
+            .map(|_| completion.response().cloned());
         if let Some(error) = relay_failure {
             self.shutdown.cancel();
             reply(&handle, StatusCode::BadGateway, None, None)
@@ -385,7 +405,7 @@ impl Inner {
                 r.as_ref()
                     .is_some_and(|r| r.status_code.kind() == StatusCodeKind::Successful)
             }) {
-                destination.bye().await.ok();
+                terminate(destination).await;
             }
             return Err(error);
         }
@@ -420,7 +440,7 @@ impl Inner {
                         reply(&handle, StatusCode::BadGateway, None, None)
                             .await
                             .ok();
-                        destination.bye().await.ok();
+                        terminate(destination).await;
                         return Err(error);
                     }
                 }
@@ -448,7 +468,7 @@ impl Inner {
         // Keep the bridge reservation until both ACK directions are complete.
         if let Err(error) = handle.wait_ack().await {
             if status.kind() == StatusCodeKind::Successful {
-                destination.bye().await.ok();
+                terminate(destination).await;
             }
             return Err(error);
         }
@@ -506,10 +526,17 @@ async fn reply(
     body: Option<Vec<u8>>,
 ) -> Result<StatusCode> {
     handle
-        .respond(status.clone(), headers, body)
+        .start_response(status.clone(), headers, body)
+        .map_err(|e| error(&e.to_string()))?
+        .wait_sent()
         .await
         .map_err(|e| error(&e.to_string()))?;
     Ok(status)
+}
+async fn terminate(dialog: &InviteDialog) {
+    if let Ok(operation) = dialog.admit_termination(Default::default()) {
+        let _ = operation.wait().await;
+    }
 }
 fn body_headers(body: &AckBody) -> Vec<Header> {
     vec![Header::ContentType(body.content_type.clone().into())]

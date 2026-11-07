@@ -304,11 +304,9 @@ async fn process_incoming_request(
 
         match tx.original.to_header()?.tag()?.as_ref() {
             Some(_) => match dialog_layer.match_dialog(&tx) {
-                Some(mut d) => {
-                    tokio::spawn(async move {
-                        d.handle(&mut tx).await?;
-                        Ok::<_, Error>(())
-                    });
+                Some(d) => {
+                    let operation = d.start_incoming_request(tx)?;
+                    tokio::spawn(async move { operation.wait().await });
                     continue;
                 }
                 None => {
@@ -328,25 +326,12 @@ async fn process_incoming_request(
                     tx.reply(rsip::StatusCode::BusyHere).await?;
                     continue;
                 }
-                let mut dialog = match dialog_layer.get_or_create_server_invite(
-                    &tx,
+                let incoming = dialog_layer.start_incoming_invite(
+                    tx,
                     state_sender.clone(),
-                    None,
                     Some(contact.clone()),
-                ) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // 481 Dialog/Transaction Does Not Exist
-                        info!("Failed to obtain dialog: {:?}", e);
-                        tx.reply(rsip::StatusCode::CallTransactionDoesNotExist)
-                            .await?;
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    dialog.handle(&mut tx).await?;
-                    Ok::<_, Error>(())
-                });
+                )?;
+                tokio::spawn(async move { incoming.wait().await });
             }
             _ => {
                 info!("Received request: {:?}", tx.original.method);

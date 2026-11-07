@@ -44,7 +44,7 @@ async fn reject_stale(role: TransactionRole, legacy: bool) -> rsipstack::Result<
     .build()?;
     let (states, mut events) = unbounded_channel();
     assert!(layer.restore_from_snapshot(snapshot, states)?);
-    let Some(Dialog::Invite(mut dialog)) = layer.get_dialog(&id) else {
+    let Some(Dialog::Invite(dialog)) = layer.get_dialog(&id) else {
         panic!("missing dialog")
     };
     let (_, incoming) = unbounded_channel();
@@ -80,7 +80,11 @@ async fn reject_stale(role: TransactionRole, legacy: bool) -> rsipstack::Result<
                 }
             }
         } else {
-            dialog.handle(&mut tx).await?;
+            dialog
+                .start_incoming_request(tx)?
+                .wait()
+                .await
+                .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
         }
         let TransportEvent::Incoming(SipMessage::Response(response), _, _) = received
             .try_recv()

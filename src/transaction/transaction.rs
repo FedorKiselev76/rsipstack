@@ -3,6 +3,7 @@ use super::endpoint::EndpointInnerRef;
 use super::invite_usage::{InviteReservation, InviteUsage};
 use super::key::TransactionKey;
 use super::{SipConnection, TransactionState, TransactionTimer, TransactionType};
+use crate::dialog::response_operation::{ResponseError, ResponseProducer, ResponseSubmission};
 use crate::dialog::DialogId;
 use crate::platform::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::platform::sync::Mutex;
@@ -50,6 +51,9 @@ pub type TransactionEventSender = UnboundedSender<TransactionEvent>;
 ///     TransactionEvent::Respond(response) => {
 ///         // Send response
 ///     },
+///     TransactionEvent::RespondTracked(response) => {
+///         // Tracked response; the owning transaction completes its receipt.
+///     },
 ///     TransactionEvent::Terminate(key) => {
 ///         // Clean up transaction
 ///     }
@@ -60,6 +64,7 @@ pub enum TransactionEvent {
     Received(SipMessage, Option<SipConnection>),
     Timer(TransactionTimer),
     Respond(Response),
+    RespondTracked(ResponseSubmission),
     Terminate(TransactionKey),
 }
 
@@ -179,6 +184,14 @@ pub struct Transaction {
     // Unencoded dialog routes, retained across target refresh and auth retry.
     pub(crate) dialog_route_set: Option<Vec<crate::sip::Route>>,
     successful_acks: AckCache,
+    pub(crate) operation: Option<Arc<crate::dialog::operation::OperationTrace>>,
+    response_acks: Vec<ResponseProducer>,
+    /// Proxy response retransmission and successful ACK belong to the end UAs.
+    pub(crate) proxy_forwarding: bool,
+    pub(crate) proxy_timeout_cancel: Option<crate::platform::CancellationToken>,
+    proxy_timeout_cancelled: bool,
+    response_origin: crate::dialog::operation::ResponseOrigin,
+    local_responses: Vec<Response>,
     /// Defer the first successful ACK until an application supplies its body.
     pub(crate) defer_success_ack: bool,
     pub(crate) force_success_ack: bool,
@@ -200,7 +213,7 @@ pub struct Transaction {
     pub(crate) initial_dialog: Mutex<Option<alloc::sync::Weak<crate::dialog::dialog::DialogInner>>>,
     retransmission: bool,
     is_cleaned_up: bool,
-    invite_reservation: Mutex<Option<InviteReservation>>,
+    pub(crate) invite_reservation: Mutex<Option<InviteReservation>>,
     pub(crate) session_timer:
         crate::platform::sync::Mutex<Option<Arc<crate::dialog::session_timer::SessionTimer>>>,
     pub(crate) reliable_provisional:
@@ -236,6 +249,13 @@ impl Transaction {
             last_response: None,
             last_ack: None,
             dialog_route_set: None,
+            operation: None,
+            response_acks: Vec::new(),
+            proxy_forwarding: false,
+            proxy_timeout_cancel: None,
+            proxy_timeout_cancelled: false,
+            response_origin: crate::dialog::operation::ResponseOrigin::Unknown,
+            local_responses: Vec::new(),
             successful_acks: AckCache::new(),
             defer_success_ack: false,
             force_success_ack: false,
@@ -277,6 +297,10 @@ impl Transaction {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn last_response_origin(&self) -> crate::dialog::operation::ResponseOrigin {
+        self.response_origin
     }
 
     pub(crate) fn track_receipt_times(&mut self, enabled: bool) {
@@ -333,8 +357,20 @@ impl Transaction {
         };
         Transaction::new(tx_type, key, original, connection, endpoint_inner)
     }
+
+    /// A separately dispatched end-to-end ACK has no server transaction. In
+    /// particular, a second ACK with the same branch must reach the router even
+    /// while the first is awaiting application admission or a transport send.
+    pub(crate) fn mark_stateless_ack(&mut self) {
+        debug_assert_eq!(self.original.method, Method::Ack);
+        self.endpoint_inner.transactions.remove(&self.key);
+        self.is_cleaned_up = true;
+    }
     // send client request
     pub async fn send(&mut self) -> Result<()> {
+        if let Some(operation) = &self.operation {
+            operation.attempt(&self.original);
+        }
         self.check_persistence()?;
         if !self.persistence_sent {
             let dialog = self.persistence_dialog.lock().upgrade();
@@ -345,6 +381,11 @@ impl Transaction {
                         Some(self.original.clone().into()),
                     )
                     .await?;
+                if dialog.persistence.lock().is_some() {
+                    if let Some(operation) = &self.operation {
+                        operation.saved();
+                    }
+                }
                 if dialog.is_terminated()
                     && !matches!(
                         self.original.method,
@@ -429,6 +470,13 @@ impl Transaction {
             if let Err(e) = connection.send(message, self.destination.as_ref()).await {
                 warn!(key = %self.key, error = %e, "send failed");
                 stream_failed = connection.is_stream();
+                if let Some(operation) = &self.operation {
+                    operation.failed(crate::dialog::operation::OperationError::Transport(
+                        e.to_string(),
+                    ));
+                }
+            } else if let Some(operation) = &self.operation {
+                operation.sent();
             }
         } else {
             debug!(key = %self.key, "no connection, will retry on timer");
@@ -561,6 +609,38 @@ impl Transaction {
     /// is acceptable. Prefer the `TransactionEvent::Respond` channel for
     /// cancellation-aware integration.
     pub async fn respond(&mut self, response: Response) -> Result<()> {
+        self.respond_submission(ResponseSubmission::untracked(response))
+            .await
+    }
+
+    /// Drive a tracked response from a custom transaction-user loop without
+    /// discarding its send/ACK receipt. Like `respond`, this must be driven by
+    /// the owning task rather than cancelled during a transport or storage wait.
+    pub async fn respond_submission(&mut self, submission: ResponseSubmission) -> Result<()> {
+        let producer = submission.producer.clone();
+        if let Some(producer) = &producer {
+            producer.trace().bind(&self.original, &submission.response);
+        }
+        let result = self.respond_submission_inner(submission).await;
+        if let (Some(producer), Err(error)) = (&producer, &result) {
+            let persistence = self
+                .persistence_dialog
+                .lock()
+                .upgrade()
+                .and_then(|dialog| dialog.persistence.lock().clone())
+                .and_then(|runtime| runtime.status.lock().failure_kind.clone());
+            let error = persistence
+                .map(ResponseError::Persistence)
+                .unwrap_or_else(|| ResponseError::Protocol(error.to_string()));
+            producer.trace().complete(Err(error.clone()));
+            if !producer.trace().transport_accepted() {
+                producer.trace().acknowledge(Err(error));
+            }
+        }
+        result
+    }
+
+    async fn respond_submission_inner(&mut self, submission: ResponseSubmission) -> Result<()> {
         self.check_persistence()?;
         match self.transaction_type {
             TransactionType::ServerInvite | TransactionType::ServerNonInvite => {}
@@ -573,8 +653,25 @@ impl Transaction {
         }
 
         let reliable = self.reliable_provisional.lock().clone();
-        let response = if let Some(server) = &reliable {
-            match server.prepare(response) {
+        if submission.producer.is_some()
+            && !(self.proxy_forwarding
+                && self.state == TransactionState::Accepted
+                && submission.response.status_code.kind() == StatusCodeKind::Successful)
+            && matches!(
+                self.state,
+                TransactionState::Accepted
+                    | TransactionState::Completed
+                    | TransactionState::Confirmed
+                    | TransactionState::Terminated
+            )
+        {
+            return Err(Error::TransactionError(
+                "a final response was already sent".into(),
+                self.key.clone(),
+            ));
+        }
+        let submission = if let Some(server) = &reliable {
+            match server.prepare_submission(submission) {
                 Ok(Some(response)) => response,
                 Ok(None) => return Ok(()),
                 Err(e) => {
@@ -583,8 +680,30 @@ impl Transaction {
                 }
             }
         } else {
-            response
+            submission
         };
+        let ResponseSubmission {
+            response,
+            producer,
+            initial_owner,
+        } = submission;
+        if let Some(owner) = initial_owner {
+            let owner = owner
+                .upgrade()
+                .ok_or_else(|| Error::Error("incoming dialog owner stopped".into()))?;
+            let previous = self
+                .initial_dialog
+                .lock()
+                .as_ref()
+                .and_then(|d| d.upgrade());
+            if !previous.as_ref().is_some_and(|p| Arc::ptr_eq(p, &owner)) {
+                self.invite_reservation.lock().take();
+                owner.reserve_invite(self)?;
+                *self.initial_dialog.lock() = Some(Arc::downgrade(&owner));
+            }
+            owner.bind_persistence(self);
+            self.check_persistence()?;
+        }
 
         let session_timer = self.session_timer.lock().clone();
         let mut response = response;
@@ -631,7 +750,10 @@ impl Transaction {
         } else {
             response.to_owned().into()
         };
-        if new_state != TransactionState::Trying && new_state != TransactionState::Proceeding {
+        let final_response =
+            new_state != TransactionState::Trying && new_state != TransactionState::Proceeding;
+        let mut checkpoint_committed = false;
+        if final_response {
             let dialog = self.persistence_dialog.lock().upgrade();
             if let Some(dialog) = dialog {
                 dialog
@@ -640,7 +762,13 @@ impl Transaction {
                         Some(response.clone()),
                     )
                     .await?;
+                checkpoint_committed = dialog.persistence.lock().is_some();
             }
+        }
+        if let (Some(producer), SipMessage::Response(response)) = (&producer, &response) {
+            producer
+                .trace()
+                .prepared(response.clone(), checkpoint_committed);
         }
         trace!(key = %self.key, response = %response, "responding");
 
@@ -668,14 +796,29 @@ impl Transaction {
             .last_response
             .as_ref()
             .filter(|_| {
-                new_state == TransactionState::Accepted && self.state != TransactionState::Accepted
+                !self.proxy_forwarding
+                    && new_state == TransactionState::Accepted
+                    && self.state != TransactionState::Accepted
             })
             .and_then(|resp| DialogId::try_from((resp, TransactionRole::Server)).ok())
             .and_then(|dialog_id| self.add_ack_cseq_route(&dialog_id));
         let mut guard = AckRouteGuard(
             ack_route.map(|route| (self.endpoint_inner.clone(), route, self.key.clone())),
         );
-        connection.send(response, self.destination.as_ref()).await?;
+        if let Err(error) = connection.send(response, self.destination.as_ref()).await {
+            if let Some(producer) = &producer {
+                let error = ResponseError::Transport(error.to_string());
+                producer.trace().complete(Err(error.clone()));
+                producer.trace().acknowledge(Err(error));
+            }
+            return Err(error);
+        }
+        if let Some(producer) = &producer {
+            producer.trace().transported();
+            if final_response && self.original.method == Method::Invite && !self.proxy_forwarding {
+                self.response_acks.push(producer.clone());
+            }
+        }
         let initial_dialog = self
             .initial_dialog
             .lock()
@@ -687,6 +830,13 @@ impl Transaction {
                     resp,
                     crate::dialog::lifecycle::LifecycleTime::now(),
                 );
+            }
+            if producer.is_some() && reliable.is_none() {
+                dialog.initial_response_sent(resp);
+            }
+            let incoming = dialog.incoming_invite.lock().upgrade();
+            if let Some(incoming) = incoming {
+                incoming.final_response(&dialog, resp);
             }
         }
         guard.0 = None;
@@ -703,6 +853,7 @@ impl Transaction {
         if let (Some(server), Some(response)) = (reliable, self.last_response.as_ref()) {
             server.sent(response);
         }
+        let mut completion_committed = false;
         if final_response {
             let dialog = self.persistence_dialog.lock().upgrade();
             if let Some(dialog) = dialog {
@@ -712,7 +863,11 @@ impl Transaction {
                         None,
                     )
                     .await?;
+                completion_committed = dialog.persistence.lock().is_some();
             }
+        }
+        if let Some(producer) = &producer {
+            producer.trace().complete(Ok(completion_committed));
         }
         Ok(())
     }
@@ -727,6 +882,16 @@ impl Transaction {
     }
 
     fn can_transition(&self, target: &TransactionState) -> Result<()> {
+        // A downstream branch can answer after another branch already failed.
+        // Retain the owned UAC exchange so that every late success is ACKed
+        // and its unwanted dialog is released by the dialog driver.
+        if self.transaction_type == TransactionType::ClientInvite
+            && self.force_success_ack
+            && self.state == TransactionState::Completed
+            && *target == TransactionState::Accepted
+        {
+            return Ok(());
+        }
         match (&self.state, target) {
             (&TransactionState::Nothing, &TransactionState::Calling)
             | (&TransactionState::Nothing, &TransactionState::Trying)
@@ -969,11 +1134,21 @@ impl Transaction {
         if let Some(ref conn) = connection {
             if let Err(e) = conn.send(ack, self.destination.as_ref()).await {
                 warn!(key = %self.key, error = %e, "ack send failed");
+                if let Some(operation) = &self.operation {
+                    operation.failed(crate::dialog::operation::OperationError::Ack(e.to_string()));
+                }
                 if self.defer_success_ack {
                     return Err(e);
                 }
+            } else if let Some(operation) = &self.operation {
+                operation.acked();
             }
         } else {
+            if let Some(operation) = &self.operation {
+                operation.failed(crate::dialog::operation::OperationError::Ack(
+                    "no connection for ACK".into(),
+                ));
+            }
             debug!(key = %self.key, "no connection for ack");
             if self.defer_success_ack {
                 return Err(Error::TransactionError(
@@ -985,14 +1160,13 @@ impl Transaction {
         if self.defer_success_ack && self.state == TransactionState::Accepted {
             self.invite_reservation.lock().take();
         }
-        // RFC 3261 §17.1.1.3 / RFC 6026 §7.2: ACK in Completed (3xx-6xx)
-        // immediately terminates the client transaction. ACK in Accepted
-        // (2xx) leaves the transaction in Accepted to absorb server-
-        // retransmitted 2xx duplicates per §7.2; Timer M drives the
-        // eventual transition to Terminated. Returning Ok(()) here lets
-        // the caller observe a successful ACK send without forcing a
-        // premature transition.
+        // Owned initial exchanges retain the Completed window for repeated
+        // negative finals and late successes from an abandoned branch. ACK in
+        // Accepted also leaves the transaction alive until Timer M expires.
         if self.state == TransactionState::Completed {
+            if self.force_success_ack && self.original.to_header()?.tag()?.is_none() {
+                return Ok(());
+            }
             self.transition(TransactionState::Terminated).map(|_| ())
         } else {
             debug_assert_eq!(
@@ -1074,6 +1248,22 @@ impl Transaction {
     ) -> Option<Option<SipMessage>> {
         match event {
             TransactionEvent::Received(msg, connection) => {
+                // Preserve the public event enum. Endpoint-delivered messages
+                // carry their connection; locally generated responses are
+                // tracked privately. External TU injection without a connection
+                // has no verifiable peer provenance.
+                self.response_origin = if connection.is_some() {
+                    crate::dialog::operation::ResponseOrigin::Peer
+                } else if let SipMessage::Response(response) = &msg {
+                    if let Some(index) = self.local_responses.iter().position(|r| r == response) {
+                        self.local_responses.remove(index);
+                        crate::dialog::operation::ResponseOrigin::Local
+                    } else {
+                        crate::dialog::operation::ResponseOrigin::Unknown
+                    }
+                } else {
+                    crate::dialog::operation::ResponseOrigin::Unknown
+                };
                 self.last_received_at = self
                     .receipt_times
                     .as_ref()
@@ -1092,6 +1282,10 @@ impl Transaction {
             }
             TransactionEvent::Respond(response) => {
                 self.respond(response).await.ok();
+                None
+            }
+            TransactionEvent::RespondTracked(submission) => {
+                self.respond_submission(submission).await.ok();
                 None
             }
             TransactionEvent::Terminate(key) => {
@@ -1130,8 +1324,12 @@ impl Transaction {
         } else {
             SipMessage::Response(response)
         };
+        if let SipMessage::Response(response) = &msg {
+            self.local_responses.push(response.clone());
+        }
+        let event = TransactionEvent::Received(msg, None);
         self.tu_sender
-            .send(TransactionEvent::Received(msg, None))
+            .send(event)
             .map_err(|e| Error::TransactionError(e.to_string(), self.key.clone()))
     }
 
@@ -1293,6 +1491,17 @@ impl Transaction {
                     // transaction. Retransmitted ACKs and late INVITE
                     // retransmissions are absorbed below the TU by
                     // `finished_transactions`.
+                    for producer in self.response_acks.drain(..) {
+                        producer.trace().acknowledge(Ok(req.clone()));
+                    }
+                    if let Some(dialog) = self
+                        .initial_dialog
+                        .lock()
+                        .as_ref()
+                        .and_then(|d| d.upgrade())
+                    {
+                        dialog.finish_server_ack(1);
+                    }
                     self.transition(TransactionState::Terminated).ok();
                     return Some(req.into());
                 }
@@ -1315,6 +1524,9 @@ impl Transaction {
                         "ignoring ACK with a CSeq that does not match the INVITE"
                     );
                     return None;
+                }
+                for producer in self.response_acks.drain(..) {
+                    producer.trace().acknowledge(Ok(req.clone()));
                 }
                 self.transition(TransactionState::Confirmed).ok();
                 return Some(req.into());
@@ -1348,7 +1560,7 @@ impl Transaction {
         }
         if self.transaction_type == TransactionType::ClientInvite
             && resp.status_code.kind() == StatusCodeKind::Successful
-            && resp.has_multiple_vias()
+            && (self.proxy_forwarding || resp.has_multiple_vias())
         {
             // A response with an upstream Via belongs to a forwarding transaction.
             // Its TU must receive every 2xx, including retransmissions and forks,
@@ -1411,6 +1623,15 @@ impl Transaction {
             }
         };
 
+        if self.state == TransactionState::Completed
+            && new_state == TransactionState::Completed
+            && self.force_success_ack
+            && self.original.to_header().ok()?.tag().ok()?.is_none()
+        {
+            self.last_response.replace(resp);
+            self.send_ack(connection).await.ok();
+            return None;
+        }
         self.can_transition(&new_state).ok()?;
 
         // RFC 6026 §7.2: every 2xx response received by a client INVITE in
@@ -1426,7 +1647,7 @@ impl Transaction {
             == TransactionType::ClientInvite
             && new_state == TransactionState::Accepted;
 
-        if !is_client_invite_2xx_in_accepted && self.state == new_state {
+        if !self.proxy_forwarding && !is_client_invite_2xx_in_accepted && self.state == new_state {
             if let Some(last) = self.last_response.as_ref() {
                 // A reliable provisional (RFC 3262) with a new RSeq is a new
                 // response even when status and body repeat; the TU must
@@ -1457,17 +1678,48 @@ impl Transaction {
         // Accepted alone so Timer M can fire and the §7.2 2xx-retransmit
         // absorption window is preserved.
         let auto_ack_client_invite = self.transaction_type == TransactionType::ClientInvite
+            && !(self.proxy_forwarding
+                && self.response_origin == crate::dialog::operation::ResponseOrigin::Local)
             && (new_state == TransactionState::Completed
                 || (new_state == TransactionState::Accepted
                     && (!self.defer_success_ack || self.last_ack.is_some())));
 
         self.transition(new_state).ok();
 
+        // RFC 3261 16.6: a stateful proxy refreshes Timer C on 101..199.
+        // Once cancellation was requested by Timer C, keep its bounded final
+        // response deadline instead of extending it with more provisionals.
+        if self.proxy_forwarding
+            && self.transaction_type == TransactionType::ClientInvite
+            && (101..200).contains(&resp.status_code.code())
+            && !self.proxy_timeout_cancelled
+        {
+            if let Some(timer) = self.timer_c.take() {
+                self.endpoint_inner.timers.cancel(timer);
+            }
+            self.timer_c = Some(self.endpoint_inner.timers.timeout(
+                self.endpoint_inner.option.timerc,
+                TransactionTimer::TimerC(self.key.clone()),
+            ));
+        }
+
         observer(
             &resp,
             self.last_received_at
                 .unwrap_or_else(crate::dialog::lifecycle::LifecycleTime::now),
         );
+        if let Some(operation) = &self.operation {
+            operation.response(&resp, self.response_origin);
+            if self.response_origin == crate::dialog::operation::ResponseOrigin::Local {
+                operation.failed(if resp.status_code == StatusCode::RequestTimeout {
+                    crate::dialog::operation::OperationError::Timeout
+                } else {
+                    crate::dialog::operation::OperationError::Transport(
+                        "local transport failure".into(),
+                    )
+                });
+            }
+        }
         let dialog = self.persistence_dialog.lock().upgrade();
         if let Some(dialog) = dialog {
             if resp.status_code.kind() != StatusCodeKind::Provisional
@@ -1579,6 +1831,8 @@ impl Transaction {
                                 if connection.is_stream() {
                                     return self.on_stream_send_failure();
                                 }
+                            } else if let Some(operation) = &self.operation {
+                                operation.sent();
                             }
                         } else {
                             debug!(key = %self.key, "timer A: no connection yet");
@@ -1615,6 +1869,17 @@ impl Transaction {
             TransactionState::Proceeding => {
                 // Non-INVITE Timer E/F is handled above, including Proceeding.
                 if matches!(timer, TransactionTimer::TimerC(_)) {
+                    if !self.proxy_timeout_cancelled {
+                        if let Some(cancel) = &self.proxy_timeout_cancel {
+                            self.proxy_timeout_cancelled = true;
+                            cancel.cancel();
+                            self.timer_c = Some(self.endpoint_inner.timers.timeout(
+                                self.endpoint_inner.option.t1x64,
+                                TransactionTimer::TimerC(self.key.clone()),
+                            ));
+                            return Ok(());
+                        }
+                    }
                     // Inform TU about timeout
                     let timeout_response = self.endpoint_inner.make_response(
                         &self.original,
@@ -1629,9 +1894,15 @@ impl Transaction {
                     // resend the response (non-2xx final — RFC 3261 §17.2.1;
                     // 2xx finals route to Accepted, never here)
                     self.retransmit_last_response(&key, &duration).await?;
-                } else if let TransactionTimer::TimerD(_) = timer {
-                    self.transition(TransactionState::Terminated)?;
-                } else if let TransactionTimer::TimerK(_) = timer {
+                } else if matches!(
+                    timer,
+                    TransactionTimer::TimerD(_) | TransactionTimer::TimerK(_)
+                ) {
+                    // Timer D is this implementation's non-2xx UAS ACK
+                    // deadline (Timer H). Expiry is not loss of the owner.
+                    for producer in self.response_acks.drain(..) {
+                        producer.trace().acknowledge(Err(ResponseError::AckTimeout));
+                    }
                     self.transition(TransactionState::Terminated)?;
                 }
             }
@@ -1653,6 +1924,19 @@ impl Transaction {
                 match (&self.transaction_type, &timer) {
                     (TransactionType::ServerInvite, TransactionTimer::TimerL(_))
                     | (TransactionType::ClientInvite, TransactionTimer::TimerM(_)) => {
+                        if self.transaction_type == TransactionType::ServerInvite {
+                            if let Some(dialog) = self
+                                .initial_dialog
+                                .lock()
+                                .as_ref()
+                                .and_then(|d| d.upgrade())
+                            {
+                                dialog.finish_server_ack(2);
+                            }
+                        }
+                        for producer in self.response_acks.drain(..) {
+                            producer.trace().acknowledge(Err(ResponseError::AckTimeout));
+                        }
                         self.transition(TransactionState::Terminated)?;
                     }
                     (TransactionType::ServerInvite, TransactionTimer::TimerG(key, duration)) => {
@@ -1798,34 +2082,40 @@ impl Transaction {
                         );
                         self.timer_l.replace(timer_l);
 
-                        let timer_g = self.endpoint_inner.timers.timeout(
-                            self.endpoint_inner.option.t1,
-                            TransactionTimer::TimerG(
-                                self.key.clone(),
+                        // A stateful proxy retains the server transaction, but
+                        // neither retransmits 2xx itself nor consumes end-to-end
+                        // ACKs. ProxyLayer enables independent ACK dispatch.
+                        if !self.proxy_forwarding {
+                            let timer_g = self.endpoint_inner.timers.timeout(
                                 self.endpoint_inner.option.t1,
-                            ),
-                        );
-                        self.timer_g.replace(timer_g);
+                                TransactionTimer::TimerG(
+                                    self.key.clone(),
+                                    self.endpoint_inner.option.t1,
+                                ),
+                            );
+                            self.timer_g.replace(timer_g);
 
-                        if let Some(ref resp) = self.last_response {
-                            let dialog_id = DialogId::try_from((resp, TransactionRole::Server))?;
-                            // Route the ACK by dialog AND INVITE CSeq: the ACK
-                            // of an earlier re-INVITE can arrive after a newer
-                            // one was answered, and must reach its own
-                            // transaction (RFC 3261 §13.2.2.4). A non-2xx ACK
-                            // matches by branch (§17.2.3) — unreachable here,
-                            // Accepted only carries 2xx. `respond` adds the
-                            // CSeq route before sending the 2xx (an ACK can
-                            // arrive before this transition).
-                            self.add_ack_cseq_route(&dialog_id);
-                            self.endpoint_inner
-                                .waiting_ack
-                                .insert(dialog_id, self.key.clone());
+                            if let Some(ref resp) = self.last_response {
+                                let dialog_id =
+                                    DialogId::try_from((resp, TransactionRole::Server))?;
+                                // Route the ACK by dialog AND INVITE CSeq: the ACK
+                                // of an earlier re-INVITE can arrive after a newer
+                                // one was answered, and must reach its own
+                                // transaction (RFC 3261 §13.2.2.4). A non-2xx ACK
+                                // matches by branch (§17.2.3) — unreachable here,
+                                // Accepted only carries 2xx. `respond` adds the
+                                // CSeq route before sending the 2xx (an ACK can
+                                // arrive before this transition).
+                                self.add_ack_cseq_route(&dialog_id);
+                                self.endpoint_inner
+                                    .waiting_ack
+                                    .insert(dialog_id, self.key.clone());
+                            }
+                            debug!(
+                                key = %self.key,
+                                "entered Accepted state (server); Timer L and Timer G armed, waiting for ACK"
+                            );
                         }
-                        debug!(
-                            key = %self.key,
-                            "entered Accepted state (server); Timer L and Timer G armed, waiting for ACK"
-                        );
                     }
                     TransactionType::ClientInvite => {
                         // RFC 6026 §7.2: client INVITE 2xx-Accepted entry.
@@ -2010,6 +2300,21 @@ impl Transaction {
         }
     }
 
+    pub(crate) fn finish_ack_dispatch(&self) {
+        self.endpoint_inner
+            .pending_ack_dispatch
+            .with_mut(|pending| {
+                pending.retain(|(_, key), token| {
+                    if key == &self.key {
+                        token.cancel();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            });
+    }
+
     fn cleanup(&mut self) {
         self.invite_reservation.lock().take();
         if self.is_cleaned_up {
@@ -2113,6 +2418,17 @@ impl Drop for AckRouteGuard {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
+        self.finish_ack_dispatch();
+        if self.transaction_type == TransactionType::ServerInvite {
+            if let Some(dialog) = self
+                .initial_dialog
+                .lock()
+                .as_ref()
+                .and_then(|d| d.upgrade())
+            {
+                dialog.finish_server_ack(3);
+            }
+        }
         self.cleanup();
         trace!(key=%self.key, state=%self.state, "transaction dropped");
     }

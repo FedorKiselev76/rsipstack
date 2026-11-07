@@ -1,15 +1,8 @@
-//! Unified INVITE dialog (`InviteDialog`).
+//! Shared INVITE session implementation and compatibility type.
 //!
-//! `InviteDialog` is the role-agnostic INVITE dialog type. It wraps the same
-//! [`DialogInnerRef`] as the legacy [`ServerInviteDialog`] /
-//! [`ClientInviteDialog`] wrappers and exposes the full method surface of
-//! both, with role-specific behavior selected by [`InviteDialog::role`].
-//!
-//! This is the preferred type going forward; the legacy types are retained
-//! as thin forwarding wrappers marked `#[deprecated]`.
-//!
-//! [`ServerInviteDialog`]: crate::dialog::server_dialog::ServerInviteDialog
-//! [`ClientInviteDialog`]: crate::dialog::client_dialog::ClientInviteDialog
+//! Existing import paths are preserved. New applications use the encapsulated
+//! [`crate::dialog::v2managed::invite_dialog::InviteDialog`] facade; legacy
+//! borrowed signaling methods are implemented in the compatibility adapter.
 
 use super::dialog::DialogInner;
 use super::dialog::InviteAck;
@@ -29,7 +22,7 @@ use tracing::{debug, info, trace, warn};
 /// RFC 3261 section 14.1 gives the Call-ID owner and its peer disjoint
 /// retry windows, in 10 ms units. The dialog role identifies that owner,
 /// regardless of which party is sending this particular re-INVITE.
-fn glare_backoff_ms(role: TransactionRole) -> u64 {
+pub(super) fn glare_backoff_ms(role: TransactionRole) -> u64 {
     let mut bytes = [0u8; 8];
     crate::transaction::fill_random_bytes(&mut bytes);
     let random = u64::from_le_bytes(bytes);
@@ -41,10 +34,18 @@ fn glare_backoff_ms(role: TransactionRole) -> u64 {
 
 /// Unified INVITE dialog that can act as either a UAS (Server) or UAC (Client).
 ///
-/// Role-specific methods (e.g. `ringing`/`accept`/`reject` for UAS, or
-/// `cancel`/`hangup`/`options`/`process_invite` for UAC) are no-ops when
-/// invoked on the "wrong" role, except `cancel` and `process_invite`, which
-/// return an error for a UAS.
+/// Use `start_request`, `start_reinvite`, `start_response`,
+/// `start_incoming_request` and `start_termination` for signaling. Legacy
+/// borrowed-future methods remain deprecated for migration. Applications can
+/// use `#![deny(deprecated)]` to prohibit accidental fallback.
+///
+/// ```compile_fail
+/// #![deny(deprecated)]
+/// use rsipstack::dialog::invite_dialog::InviteDialog;
+/// async fn legacy_call(dialog: &InviteDialog) {
+///     let _ = dialog.bye().await;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct InviteDialog {
     pub(super) inner: DialogInnerRef,
@@ -64,7 +65,6 @@ impl InviteDialog {
     pub fn from_inner(inner: DialogInnerRef) -> Self {
         Self { inner }
     }
-
     /// The dialog role (Client = UAC we initiated, Server = UAS we received).
     pub fn role(&self) -> TransactionRole {
         self.inner.role
@@ -85,6 +85,12 @@ impl InviteDialog {
             .lock()
             .as_ref()
             .map(|runtime| runtime.status.lock().clone())
+    }
+
+    /// Capture a cutoff of accepted persistence work. Later writes do not extend
+    /// it. A storage callback must not await its own dialog's barrier.
+    pub fn persistence_barrier(&self) -> super::persistence::PersistenceBarrier {
+        self.inner.persistence_barrier()
     }
 
     pub fn snapshot(&self) -> super::dialog::DialogSnapshot {
@@ -127,190 +133,74 @@ impl InviteDialog {
 
     // ── UAS (Server) semantics ────────────────────────────────────────────
 
-    /// Send `180 Ringing` (or `183 Session Progress` when a body is given).
-    /// No-op for UAC dialogs.
-    pub fn ringing(&self, headers: Option<Vec<Header>>, body: Option<Vec<u8>>) -> Result<()> {
-        if self.role() != TransactionRole::Server {
-            return Ok(());
-        }
-        if !self.inner.can_cancel() {
-            return Ok(());
-        }
-        debug!(id = %self.id(), "sending ringing response");
-        let resp = self.inner.make_response(
-            &self.initial_request(),
-            if body.is_some() {
-                StatusCode::SessionProgress
-            } else {
-                StatusCode::Ringing
-            },
-            headers,
-            body,
-        );
-        self.inner
-            .tu_sender
-            .send(TransactionEvent::Respond(resp.clone()))?;
-        if self.inner.reliable_config.lock().is_none() || !self.inner.supports_100rel {
-            self.inner.transition(DialogState::Early(self.id(), resp));
-        }
-        Ok(())
-    }
-
-    /// Accept the incoming INVITE with a `200 OK`.
-    /// No-op for UAC dialogs.
-    pub fn accept(&self, headers: Option<Vec<Header>>, body: Option<Vec<u8>>) -> Result<()> {
-        if self.role() != TransactionRole::Server {
-            return Ok(());
-        }
-        let resp = self
-            .inner
-            .make_response(&self.initial_request(), StatusCode::OK, headers, body);
-        self.inner
-            .tu_sender
-            .send(TransactionEvent::Respond(resp.clone()))?;
-        if self.inner.reliable_config.lock().is_none() || !self.inner.supports_100rel {
-            self.inner.transition(DialogState::WaitAck(self.id(), resp));
-        }
-        Ok(())
-    }
-
-    /// Accept the incoming INVITE with a NAT-aware public Contact header.
-    /// No-op for UAC dialogs.
-    pub fn accept_with_public_contact(
+    /// Submit a response to the original incoming INVITE. The owning dialog
+    /// handler must remain running. Dropping the receipt does not cancel the
+    /// command; its send and matching ACK can be observed independently.
+    pub fn start_response(
         &self,
-        username: &str,
-        public_address: Option<crate::sip::HostWithPort>,
-        local_address: &crate::transport::SipAddr,
+        status: StatusCode,
         headers: Option<Vec<Header>>,
         body: Option<Vec<u8>>,
-    ) -> Result<()> {
-        use super::registration::Registration;
-
-        let contact_header =
-            Registration::create_nat_aware_contact(username, public_address, local_address);
-
-        let mut final_headers = headers.unwrap_or_default();
-        final_headers.push(contact_header.into());
-
-        self.accept(Some(final_headers), body)
-    }
-
-    /// Reject the incoming INVITE (default `603 Decline`).
-    /// No-op for UAC dialogs.
-    pub fn reject(&self, code: Option<StatusCode>, reason: Option<String>) -> Result<()> {
+    ) -> core::result::Result<
+        super::response_operation::ResponseReceipt,
+        super::response_operation::ResponseError,
+    > {
+        use super::response_operation::{ResponseError, ResponseReceipt, ResponseSubmission};
         if self.role() != TransactionRole::Server {
-            return Ok(());
+            return Err(ResponseError::Protocol(
+                "only an incoming INVITE can be answered".into(),
+            ));
         }
-        if self.inner.is_terminated() || self.inner.is_confirmed() {
-            return Ok(());
+        if !self.inner.can_cancel() {
+            return Err(ResponseError::Protocol(
+                "initial INVITE no longer accepts responses".into(),
+            ));
         }
-        {
-            let state = self.inner.state.lock();
-            if state.is_terminated() || state.is_confirmed() {
-                return Ok(());
-            }
-            self.inner.record_local_termination();
-        }
-        debug!(id = %self.id(), ?code, ?reason, "rejecting dialog");
-        let headers = reason.map(|reason| vec![Header::Reason(reason.into())]);
-        let resp = self.inner.make_response(
-            &self.initial_request(),
-            code.unwrap_or(StatusCode::Decline),
-            headers,
-            None,
-        );
+        let (receipt, producer) = ResponseReceipt::pair();
+        let selects_branch = status != StatusCode::Trying;
+        let response = self
+            .inner
+            .make_response(&self.initial_request(), status, headers, body);
         self.inner
-            .tu_sender
-            .send(TransactionEvent::Respond(resp))
-            .ok();
-        self.inner.transition(DialogState::Terminated(
-            self.id(),
-            TerminatedReason::UasDecline,
-        ));
-        Ok(())
+            .initial_responses
+            .submit(&response.status_code.clone(), || {
+                self.inner
+                    .tu_sender
+                    .send(
+                        ResponseSubmission {
+                            response,
+                            producer: Some(producer),
+                            initial_owner: Some(Arc::downgrade(&self.inner)),
+                        }
+                        .event(),
+                    )
+                    .map_err(|_| ResponseError::Closed)?;
+                if selects_branch {
+                    if let Some(incoming) = self.inner.incoming_invite.lock().upgrade() {
+                        incoming.select_response(&self.inner);
+                    }
+                }
+                Ok(())
+            })?;
+        Ok(receipt)
     }
 
     // ── UAC (Client) semantics ────────────────────────────────────────────
 
-    /// Send a BYE request to terminate the dialog.
-    /// No-op for UAS dialogs (which terminate via `hangup_with_headers`).
-    pub async fn hangup(&self) -> Result<()> {
-        self.hangup_with_headers(None).await
-    }
-
-    /// Terminate the dialog: send BYE when confirmed, CANCEL when still early.
-    /// Role-agnostic: an unanswered UAS dialog is left alone (it ends with
-    /// `reject()`), and `bye_with_headers()` handles the confirmed UAS/UAC
-    /// case uniformly.
-    pub async fn hangup_with_headers(&self, headers: Option<Vec<Header>>) -> Result<()> {
-        if self.inner.can_cancel() {
-            if self.role() != TransactionRole::Client {
-                return Ok(());
-            }
-            self.cancel().await
-        } else {
-            self.bye_with_headers(headers).await
+    /// Admit cancellation of an initial INVITE created with
+    /// `DialogLayer::start_invite`. The returned receipt observes CANCEL
+    /// separately from the INVITE, which may still complete successfully.
+    pub fn start_cancel(&self) -> Result<super::initial_operation::CancelOperation> {
+        let control = self.inner.initial_operation.lock().upgrade();
+        if let Some(control) = control {
+            return Ok(control.cancel());
         }
-    }
-
-    /// Hang up and attach a SIP `Reason` header to the BYE.
-    /// No-op for UAS dialogs.
-    pub async fn hangup_with_reason(&self, reason: String) -> Result<()> {
-        self.hangup_with_headers(Some(vec![Header::Reason(reason.into())]))
-            .await
-    }
-
-    /// Send a CANCEL request to abort an unanswered INVITE.
-    ///
-    /// * `Calling` (no response yet): returns `Ok(())` at once. The CANCEL
-    ///   is sent when the first provisional response arrives (RFC 3261
-    ///   §9.1); `process_invite` (`do_invite`, `do_invite_async`) sends it.
-    /// * `Trying` / `Early`: sends the CANCEL and returns its outcome.
-    ///
-    /// In both cases a 2xx to the INVITE is ACKed and then ended with a BYE
-    /// (with `auto_ack_2xx` off the ACK stays the caller's), the dialog
-    /// reports `Terminated(UacCancel)`, never `Confirmed`, and is not
-    /// registered in the dialog layer. A challenge (401/407) is final.
-    /// Once a final response arrived there is nothing to cancel: `Ok(())`.
-    /// A UAS cannot send CANCEL: an error; end the INVITE with `reject()`.
-    pub async fn cancel(&self) -> Result<()> {
-        if self.role() != TransactionRole::Client {
-            return Err(crate::Error::DialogError(
-                "cancel is a UAC operation; use reject()".to_string(),
-                self.id(),
-                StatusCode::ServerInternalError,
-            ));
+        if self.inner.is_confirmed() || self.inner.is_terminated() {
+            return Ok(super::initial_operation::CancelOperation::already_final());
         }
-        let deferred = {
-            // Decided under the state lock, so `process_invite` either sees
-            // the deferred CANCEL after leaving Calling or we see it left.
-            let state = self.inner.state.lock();
-            match *state {
-                DialogState::Calling(_) => {
-                    self.inner.record_local_termination();
-                    self.inner.cancel_requested.store(true, Ordering::SeqCst);
-                    self.inner.cancel_deferred.store(true, Ordering::SeqCst);
-                    true
-                }
-                DialogState::Trying(_) | DialogState::Early(_, _) => {
-                    self.inner.record_local_termination();
-                    self.inner.cancel_requested.store(true, Ordering::SeqCst);
-                    false
-                }
-                _ => return Ok(()),
-            }
-        };
-        self.inner
-            .checkpoint(
-                super::persistence::DialogCheckpointReason::LocalTerminationRequested,
-                None,
-            )
-            .await?;
-        if deferred {
-            Ok(())
-        } else {
-            self.send_cancel().await
-        }
+        Err(crate::Error::Error(
+            "initial cancellation requires an INVITE admitted through start_invite".into(),
+        ))
     }
 
     /// Send the CANCEL `cancel()` deferred in Calling, once the INVITE got a
@@ -370,27 +260,6 @@ impl InviteDialog {
         Ok(())
     }
 
-    /// Send an OPTIONS request within the dialog.
-    /// No-op for UAS dialogs.
-    pub async fn options(&self, headers: Option<Vec<Header>>) -> Result<Option<Response>> {
-        if self.role() != TransactionRole::Client {
-            return Ok(None);
-        }
-        self.request(Method::Options, headers, None).await
-    }
-
-    /// Drive the outbound INVITE transaction until a final response arrives.
-    /// Only meaningful for UAC dialogs.
-    /// `Confirmed` is notified before sending the initial ACK, allowing an
-    /// incoming BYE immediately. This method returns after the ACK attempt;
-    /// local `bye()`/`hangup()` calls wait for that attempt to complete.
-    pub async fn process_invite(
-        &self,
-        tx: &mut Transaction,
-    ) -> Result<(DialogId, Option<Response>)> {
-        self.process_invite_with_registration(tx, |_| {}).await
-    }
-
     pub(super) async fn process_invite_with_registration(
         &self,
         tx: &mut Transaction,
@@ -413,6 +282,20 @@ impl InviteDialog {
             self.inner.lifecycle.lock().sender.is_some() || self.inner.persistence.lock().is_some(),
         );
         let mut timer_retries = 0;
+        let initial_control = self.inner.initial_operation.lock().upgrade();
+        if let Some(control) = &initial_control {
+            if !control.begin_attempt() {
+                control.suppressed.store(true, Ordering::SeqCst);
+                control
+                    .trace
+                    .failed(super::operation::OperationError::CancelledBeforeSend);
+                self.inner.transition(DialogState::Terminated(
+                    self.id(),
+                    TerminatedReason::UacCancel,
+                ));
+                return Ok((self.id(), None));
+            }
+        }
         tx.send().await?;
         // Record the flow the INVITE actually went out on, so later
         // in-dialog requests (BYE / re-INVITE / INFO) reuse it instead of
@@ -429,6 +312,9 @@ impl InviteDialog {
             let mut timer_result = Ok(());
             let msg = tx
                 .receive_with_response_observer(|resp, received_at| {
+                    if let Some(control) = &initial_control {
+                        control.observe_response(resp);
+                    }
                     let peer_uuid = resp.session_id_header().and_then(|s| s.local_uuid());
                     self.inner.observe_peer_session_uuid(peer_uuid);
                     if resp.status_code.kind() == StatusCodeKind::Successful {
@@ -457,7 +343,7 @@ impl InviteDialog {
             }
             let cancelled = established?;
             if let Err(error) = timer_result {
-                self.bye().await.ok();
+                self.send_bye_headers(None).await.ok();
                 return Err(error);
             }
             let Some(msg) = msg else { break };
@@ -469,7 +355,6 @@ impl InviteDialog {
                 SipMessage::Request(_) => {}
                 SipMessage::Response(resp) => {
                     let status = resp.status_code.clone();
-
                     if status == StatusCode::Trying {
                         self.inner.transition(DialogState::Trying(self.id()));
                         self.send_deferred_cancel();
@@ -510,6 +395,7 @@ impl InviteDialog {
                             break;
                         }
                         if let Some(credential) = &self.inner.credential {
+                            let challenge = resp.clone();
                             *tx = handle_client_authenticate(
                                 self.inner.increment_local_seq(),
                                 tx,
@@ -517,6 +403,17 @@ impl InviteDialog {
                                 credential,
                             )
                             .await?;
+                            if initial_control
+                                .as_ref()
+                                .is_some_and(|control| !control.begin_attempt())
+                            {
+                                final_response = Some(challenge);
+                                self.inner.transition(DialogState::Terminated(
+                                    self.id(),
+                                    TerminatedReason::UacCancel,
+                                ));
+                                break;
+                            }
                             self.inner.reserve_invite(tx)?;
                             self.inner.bind_persistence(tx);
                             tx.track_receipt_times(
@@ -550,6 +447,17 @@ impl InviteDialog {
                                 timer.retry(&self.inner, tx, &resp, &mut timer_retries)?
                             {
                                 *tx = next;
+                                if initial_control
+                                    .as_ref()
+                                    .is_some_and(|control| !control.begin_attempt())
+                                {
+                                    final_response = Some(resp);
+                                    self.inner.transition(DialogState::Terminated(
+                                        self.id(),
+                                        TerminatedReason::UacCancel,
+                                    ));
+                                    break;
+                                }
                                 self.inner.reserve_invite(tx)?;
                                 self.inner.update_remote_tag("")?;
                                 *self.inner.initial_request.lock() = tx.original.clone();
@@ -581,7 +489,8 @@ impl InviteDialog {
                         _ if resp.status_code.kind() == StatusCodeKind::Successful => {
                             // Already established before the ACK. Never confirm
                             // again: an incoming BYE may have terminated it.
-                            if cancelled {
+                            if cancelled && self.inner.initial_operation.lock().upgrade().is_none()
+                            {
                                 self.bye_2xx_of_cancelled(resp);
                             }
                         }
@@ -641,6 +550,18 @@ impl InviteDialog {
             self.inner.update_remote_tag(tag.value())?;
         }
         self.update_remote_target_from_2xx(resp)?;
+        let control = self.inner.initial_operation.lock().upgrade();
+        if let Some(control) = control {
+            let operation = self
+                .admit_operation(Method::Bye, control.termination_headers(), None, None, true)
+                .map_err(|e| crate::Error::Error(e.to_string()))?;
+            let result = operation.wait().await;
+            let signaling = result
+                .signaling_result()
+                .map_err(|e| crate::Error::Error(e.to_string()));
+            *control.cleanup.lock() = Some(result);
+            return signaling;
+        }
         let request = self
             .inner
             .make_request(Method::Bye, None, None, None, None, None)?;
@@ -699,224 +620,6 @@ impl InviteDialog {
 
     // ── Shared request semantics ──────────────────────────────────────────
 
-    /// Send a BYE request to terminate the dialog.
-    /// Convenience alias for [`bye_with_headers`](Self::bye_with_headers).
-    pub async fn bye(&self) -> Result<()> {
-        self.bye_with_headers(None).await
-    }
-
-    /// Send a BYE request with custom headers (role-aware termination reason).
-    ///
-    /// BYE can only be sent from `Confirmed` (or `WaitAck` for a server dialog).
-    /// A UAC waits for its initial ACK attempt before sending the BYE.
-    /// Calling BYE in any other non-terminated state returns an error; terminated
-    /// dialogs remain a silent no-op.
-    ///
-    /// # Returns
-    /// * `Ok(())` - BYE was sent successfully or dialog is already terminated.
-    /// * `Err(Error)` - Failed to build/send BYE request, or dialog is in a state where BYE does not apply.
-    ///
-    /// Once the BYE is handed to its transaction the dialog is `Terminated`,
-    /// even when an error is returned (RFC 3261 §15.1.1).
-    pub async fn bye_with_headers(&self, headers: Option<Vec<Header>>) -> Result<()> {
-        let confirmed_or_waiting_ack = self.inner.is_confirmed()
-            || (self.role() == TransactionRole::Server && self.inner.waiting_ack());
-        if !confirmed_or_waiting_ack {
-            if !self.inner.is_terminated() {
-                warn!(
-                    dialog_id = %self.id(),
-                    state = %self.state(),
-                    "bye skipped: dialog not confirmed or waiting ack"
-                );
-                return Err(crate::Error::Error(format!(
-                    "dialog {} cannot send BYE in state {}",
-                    self.id(),
-                    self.state()
-                )));
-            }
-            return Ok(());
-        }
-
-        let request = self
-            .inner
-            .make_request(Method::Bye, None, None, None, headers, None)?;
-
-        let reason = match self.role() {
-            TransactionRole::Server => TerminatedReason::UasBye,
-            TransactionRole::Client => TerminatedReason::UacBye,
-        };
-        self.inner.send_bye(request, reason).await
-    }
-
-    /// Send a BYE request with a SIP `Reason` header.
-    pub async fn bye_with_reason(&self, reason: String) -> Result<()> {
-        self.bye_with_headers(Some(vec![Header::Reason(reason.into())]))
-            .await
-    }
-
-    /// Send a re-INVITE request to modify the session.
-    /// Returns `DialogError` with `RequestPending` while another INVITE
-    /// transaction prevents a new local INVITE (RFC 3261 §14.1).
-    pub async fn reinvite(
-        &self,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        if !self.inner.is_confirmed() {
-            return Ok(None);
-        }
-        debug!(
-            id = %self.id(),
-            body = ?body.as_deref().map(String::from_utf8_lossy),
-            "sending re-invite request"
-        );
-        let request = self
-            .inner
-            .make_request(Method::Invite, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
-    }
-
-    /// re-INVITE with glare handling (RFC 3261 §14.1): on 491 retry after a
-    /// jittered backoff, up to `max_attempts` total. The original caller
-    /// (Call-ID owner) waits 2.1–4.0 s; the original callee waits 0–2.0 s.
-    pub async fn reinvite_with_glare_retry(
-        &self,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-        max_attempts: usize,
-    ) -> Result<Option<Response>> {
-        for attempt in 0..max_attempts {
-            let resp = self.reinvite(headers.clone(), body.clone()).await?;
-            let glare = matches!(
-                resp.as_ref(),
-                Some(r) if r.status_code == StatusCode::RequestPending
-            );
-            if !glare {
-                return Ok(resp);
-            }
-            if attempt + 1 == max_attempts {
-                return Err(crate::Error::Error(alloc::format!(
-                    "re-INVITE glare: exhausted {max_attempts} retries (491)"
-                )));
-            }
-            let backoff_ms = glare_backoff_ms(self.role());
-            warn!(
-                id = %self.id(),
-                attempt,
-                backoff_ms,
-                "re-INVITE glare (491), retrying"
-            );
-            crate::platform::sleep(core::time::Duration::from_millis(backoff_ms)).await;
-        }
-        Err(crate::Error::Error(alloc::string::String::from(
-            "re-INVITE glare: no attempts made",
-        )))
-    }
-
-    /// Send an UPDATE request to modify session parameters.
-    pub async fn update(
-        &self,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        if !self.inner.is_confirmed() {
-            return Ok(None);
-        }
-        debug!(
-            id = %self.id(),
-            body = ?body.as_deref().map(String::from_utf8_lossy),
-            "sending update request"
-        );
-        let request = self
-            .inner
-            .make_request(Method::Update, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
-    }
-
-    /// Send an INFO request for mid-dialog information.
-    pub async fn info(
-        &self,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        if !self.inner.is_confirmed() {
-            return Ok(None);
-        }
-        debug!(
-            id = %self.id(),
-            body = ?body.as_deref().map(String::from_utf8_lossy),
-            "sending info request"
-        );
-        let request = self
-            .inner
-            .make_request(Method::Info, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
-    }
-
-    /// Send a generic in-dialog request.
-    pub async fn request(
-        &self,
-        method: Method,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        if !self.inner.is_confirmed() {
-            return Ok(None);
-        }
-        debug!(id = %self.id(), %method, "sending request");
-        let request = self
-            .inner
-            .make_request(method, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
-    }
-
-    /// Send a NOTIFY request.
-    pub async fn notify(
-        &self,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        self.request(Method::Notify, headers, body).await
-    }
-
-    /// Send a REFER request to transfer the call.
-    pub async fn refer(
-        &self,
-        refer_to: impl Into<crate::sip::ReferTo>,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        let mut headers = headers.unwrap_or_default();
-        headers.push(Header::ReferTo(refer_to.into()));
-        self.request(Method::Refer, Some(headers), body).await
-    }
-
-    /// Send a REFER progress notification (RFC 3515).
-    pub async fn notify_refer(
-        &self,
-        status: StatusCode,
-        sub_state: &str,
-    ) -> Result<Option<Response>> {
-        let headers = vec![
-            Header::Event("refer".into()),
-            Header::SubscriptionState(sub_state.into()),
-            Header::ContentType("message/sipfrag".into()),
-        ];
-
-        let body = format!("SIP/2.0 {} {:?}", u16::from(status.clone()), status).into_bytes();
-
-        self.notify(Some(headers), Some(body)).await
-    }
-
-    /// Send a MESSAGE request within the dialog.
-    pub async fn message(
-        &self,
-        headers: Option<Vec<Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<Response>> {
-        self.request(Method::Message, headers, body).await
-    }
-
     /// Convert this INVITE dialog to a subscription dialog (role-aware).
     pub fn as_subscription(&self) -> super::dialog::Dialog {
         match self.role() {
@@ -931,9 +634,28 @@ impl InviteDialog {
 
     // ── Incoming request handling ─────────────────────────────────────────
 
-    /// Handle an incoming transaction routed to this dialog.
-    pub async fn handle(&mut self, tx: &mut Transaction) -> Result<()> {
+    pub(crate) async fn handle_admitted(
+        &mut self,
+        tx: &mut Transaction,
+        sequence_admitted: bool,
+    ) -> Result<()> {
+        let result = self.handle_transaction(tx, sequence_admitted).await;
+        tx.finish_ack_dispatch();
+        result
+    }
+
+    async fn handle_transaction(
+        &mut self,
+        tx: &mut Transaction,
+        sequence_admitted: bool,
+    ) -> Result<()> {
         self.inner.bind_persistence(tx);
+        if self.inner.is_terminated() && tx.original.method != Method::PRack {
+            if tx.original.method != Method::Ack {
+                tx.reply(StatusCode::CallTransactionDoesNotExist).await?;
+            }
+            return Ok(());
+        }
         trace!(
             id = %self.id(),
             method = %tx.original.method,
@@ -960,11 +682,12 @@ impl InviteDialog {
         // transaction layer. Neither participates in the dialog sequence.
         // Re-evaluate the comparison after every competing update: a failed
         // one-shot CAS must not admit a stale request or lose a newer CSeq.
-        let sequence = if matches!(tx.original.method, Method::Ack | Method::Cancel) {
-            Ok(self.inner.remote_seq.load(Ordering::Relaxed))
-        } else {
-            self.inner.admit_remote_seq(cseq, &tx.original.method)
-        };
+        let sequence =
+            if sequence_admitted || matches!(tx.original.method, Method::Ack | Method::Cancel) {
+                Ok(self.inner.remote_seq.load(Ordering::Relaxed))
+            } else {
+                self.inner.admit_remote_seq(cseq, &tx.original.method)
+            };
         if let Err(remote_seq) = sequence {
             // The receiver is the UAS of this request, regardless of who
             // originated the dialog (RFC 3261 section 12.2.2).
@@ -986,6 +709,18 @@ impl InviteDialog {
         // A locally originated dialog can receive PRACK for its re-INVITE.
         if tx.original.method == Method::PRack {
             return self.handle_prack(tx).await;
+        }
+        // OPTIONS is valid in an early dialog and while a UAS awaits ACK too.
+        // Sequence admission above is shared with confirmed requests; the
+        // application supplies response policy, never its own CSeq gate.
+        if tx.original.method == Method::Options {
+            return self.handle_options(tx).await;
+        }
+        if tx.original.method == Method::Info && self.inner.waiting_ack() {
+            let (handle, rx) = TransactionHandle::new();
+            self.inner
+                .transition(DialogState::Info(self.id(), tx.original.clone(), handle));
+            return self.inner.process_transaction_handle(tx, rx).await;
         }
         if self.inner.is_confirmed() {
             // Validate before the application can change its media state or
@@ -1109,12 +844,27 @@ impl InviteDialog {
             TransactionRole::Server => TerminatedReason::UacBye,
             TransactionRole::Client => TerminatedReason::UasBye,
         };
-        self.inner.terminate_remote_bye(
-            reason,
-            tx.original_received_at
-                .unwrap_or_else(super::lifecycle::LifecycleTime::now),
-        );
+        self.inner
+            .terminate_remote_bye(
+                reason,
+                tx.original_received_at
+                    .unwrap_or_else(super::lifecycle::LifecycleTime::now),
+                &tx.original,
+            )
+            .await?;
+        let incoming = self.inner.incoming_invite.lock().upgrade();
+        let final_response = incoming
+            .map(|incoming| incoming.finish_early_bye(&self.inner))
+            .transpose();
         tx.reply(StatusCode::OK).await?;
+        if let Some(Some(receipt)) =
+            final_response.map_err(|e| crate::Error::Error(e.to_string()))?
+        {
+            receipt
+                .wait_sent()
+                .await
+                .map_err(|e| crate::Error::Error(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1274,48 +1024,6 @@ impl InviteDialog {
     }
 }
 
-impl From<crate::dialog::server_dialog::ServerInviteDialog> for InviteDialog {
-    fn from(d: crate::dialog::server_dialog::ServerInviteDialog) -> Self {
-        Self { inner: d.inner }
-    }
-}
-
-impl From<crate::dialog::client_dialog::ClientInviteDialog> for InviteDialog {
-    fn from(d: crate::dialog::client_dialog::ClientInviteDialog) -> Self {
-        Self { inner: d.inner }
-    }
-}
-
-impl TryFrom<InviteDialog> for crate::dialog::server_dialog::ServerInviteDialog {
-    type Error = crate::Error;
-
-    fn try_from(d: InviteDialog) -> Result<Self> {
-        if d.role() != TransactionRole::Server {
-            return Err(crate::Error::DialogError(
-                "InviteDialog is not a Server dialog".to_string(),
-                d.id(),
-                StatusCode::BadRequest,
-            ));
-        }
-        Ok(Self { inner: d.inner })
-    }
-}
-
-impl TryFrom<InviteDialog> for crate::dialog::client_dialog::ClientInviteDialog {
-    type Error = crate::Error;
-
-    fn try_from(d: InviteDialog) -> Result<Self> {
-        if d.role() != TransactionRole::Client {
-            return Err(crate::Error::DialogError(
-                "InviteDialog is not a Client dialog".to_string(),
-                d.id(),
-                StatusCode::BadRequest,
-            ));
-        }
-        Ok(Self { inner: d.inner })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,5 +1040,38 @@ mod tests {
                 assert_eq!(delay % 10, 0, "RFC 3261 section 14.1 uses 10 ms units");
             }
         }
+    }
+}
+
+impl InviteDialog {
+    /// Protocol cleanup inside an existing driver; never starts a nested operation.
+    pub(super) async fn send_bye_headers(&self, headers: Option<Vec<Header>>) -> Result<()> {
+        let confirmed_or_waiting_ack = self.inner.is_confirmed()
+            || (self.role() == TransactionRole::Server && self.inner.waiting_ack());
+        if !confirmed_or_waiting_ack {
+            if !self.inner.is_terminated() {
+                warn!(
+                    dialog_id = %self.id(),
+                    state = %self.state(),
+                    "bye skipped: dialog not confirmed or waiting ack"
+                );
+                return Err(crate::Error::Error(format!(
+                    "dialog {} cannot send BYE in state {}",
+                    self.id(),
+                    self.state()
+                )));
+            }
+            return Ok(());
+        }
+
+        let request = self
+            .inner
+            .make_request(Method::Bye, None, None, None, headers, None)?;
+
+        let reason = match self.role() {
+            TransactionRole::Server => TerminatedReason::UasBye,
+            TransactionRole::Client => TerminatedReason::UacBye,
+        };
+        self.inner.send_bye(request, reason).await
     }
 }

@@ -11,15 +11,12 @@ mod proxy;
 mod sipp;
 use rsipstack::{
     dialog::{
-        dialog::{Dialog, DialogState, DialogStateSender},
+        dialog::{DialogState, DialogStateSender},
         dialog_layer::DialogLayer,
         invite_dialog::InviteDialog,
     },
     sip::{prelude::HeadersExt, Method, Request, Response, SipMessage, StatusCode, Uri},
-    transaction::{
-        endpoint::{MessageInspector, TransportEventInspector},
-        TransactionState, TransactionType,
-    },
+    transaction::endpoint::{MessageInspector, TransportEventInspector},
     transport::{
         tcp_listener::TcpListenerConnection, udp::UdpConnection, SipAddr, TransportEvent,
         TransportLayer,
@@ -427,6 +424,7 @@ pub struct Stack {
     pub sender: DialogStateSender,
     pub states: Arc<Mutex<Vec<DialogState>>>,
     pub incoming: mpsc::UnboundedReceiver<InviteDialog>,
+    pub event_transactions: mpsc::UnboundedReceiver<rsipstack::transaction::Transaction>,
     pub uri: Uri,
     pub wire: Wire,
     pub faults: Option<faults::Control>,
@@ -453,17 +451,22 @@ impl Drop for Stack {
 
 impl Stack {
     pub async fn start(transport: &str, dir: &Path) -> TestResult<Self> {
-        Self::start_inner(transport, dir, None).await
+        Self::start_inner(transport, dir, None, false).await
     }
 
     pub async fn with_faults(dir: &Path, rules: Vec<faults::Rule>) -> TestResult<Self> {
-        Self::start_inner("udp", dir, Some(rules)).await
+        Self::start_inner("udp", dir, Some(rules), false).await
+    }
+
+    pub async fn start_events(transport: &str, dir: &Path) -> TestResult<Self> {
+        Self::start_inner(transport, dir, None, true).await
     }
 
     async fn start_inner(
         transport: &str,
         dir: &Path,
         rules: Option<Vec<faults::Rule>>,
+        route_events: bool,
     ) -> TestResult<Self> {
         let cancel = CancellationToken::new();
         let layer = TransportLayer::new(cancel.child_token());
@@ -529,6 +532,7 @@ impl Stack {
         let handlers = Arc::new(Mutex::new(Vec::new()));
         let (sender, mut receiver) = layer.new_dialog_state_channel();
         let (incoming_tx, incoming) = mpsc::unbounded_channel();
+        let (event_tx, event_transactions) = mpsc::unbounded_channel();
         let states = Arc::new(Mutex::new(Vec::new()));
         let mut stack = Self {
             cancel,
@@ -539,6 +543,7 @@ impl Stack {
             sender: sender.clone(),
             states: states.clone(),
             incoming,
+            event_transactions,
             uri: uri.clone(),
             wire,
             faults,
@@ -578,6 +583,15 @@ impl Stack {
             .tasks
             .push(errors.spawn("transaction router", async move {
                 while let Some(mut tx) = transactions.recv().await {
+                    if route_events
+                        && matches!(
+                            tx.original.method,
+                            Method::Subscribe | Method::Notify | Method::Publish
+                        )
+                    {
+                        event_tx.send(tx).required()?;
+                        continue;
+                    }
                     let dialog = if let Some(d) = dialogs.match_dialog(&tx) {
                         Some(d)
                     } else if tx.original.method == Method::Invite
@@ -589,38 +603,31 @@ impl Stack {
                             .required()?
                             .is_none()
                     {
-                        let d = dialogs
-                            .get_or_create_server_invite(
-                                &tx,
-                                state_sender.clone(),
-                                None,
-                                Some(contact.clone()),
-                            )
+                        let incoming = dialogs
+                            .start_incoming_invite(tx, state_sender.clone(), Some(contact.clone()))
                             .required()?;
-                        incoming_tx.send(d.clone()).required()?;
-                        Some(Dialog::Invite(d))
+                        incoming_tx.send(incoming.dialog()).required()?;
+                        let task = handler_errors.spawn("initial dialog", async move {
+                            incoming.wait().await.required()?;
+                            Ok(())
+                        });
+                        handlers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(task);
+                        continue;
                     } else {
                         None
                     };
-                    if let Some(mut dialog) = dialog {
+                    if let Some(dialog) = dialog {
                         let context = format!(
                             "dialog handler: {} {}",
                             tx.original.method,
                             tx.original.call_id_header().required()?
                         );
+                        let operation = dialog.start_incoming_request(tx).required()?;
                         let task = handler_errors.spawn(context, async move {
-                            dialog.handle(&mut tx).await.required()?;
-                            // CANCEL can finish the dialog before the non-2xx ACK.
-                            // receive() drives retransmission and cleanup timers;
-                            // dropping the transaction here would cancel them.
-                            if tx.transaction_type == TransactionType::ServerInvite
-                                && matches!(
-                                    tx.state,
-                                    TransactionState::Completed | TransactionState::Confirmed
-                                )
-                            {
-                                while tx.receive().await.is_some() {}
-                            }
+                            operation.wait().await.required()?;
                             Ok(())
                         });
                         handlers

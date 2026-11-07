@@ -41,6 +41,7 @@ pub struct DialogLayerInner {
     pub(super) last_seq: AtomicU32,
     pub(super) dialogs: RwMap<DialogId, Dialog>,
     retired_reliable: RwMap<DialogId, Dialog>,
+    recovery_operations: crate::platform::sync::Mutex<alloc::collections::BTreeSet<DialogId>>,
     pub(super) session_timer_config:
         crate::platform::sync::Mutex<Option<super::session_timer::SessionTimerConfig>>,
     pub(super) reliable_config:
@@ -153,6 +154,9 @@ impl DialogLayer {
                 persistence_config: crate::platform::sync::Mutex::new(None),
                 lifecycle_sender: crate::platform::sync::Mutex::new(None),
                 dialogs: RwMap::new(),
+                recovery_operations: crate::platform::sync::Mutex::new(
+                    alloc::collections::BTreeSet::new(),
+                ),
                 retired_reliable: RwMap::new(),
                 reliable_config: crate::platform::sync::Mutex::new(None),
                 session_timer_config: crate::platform::sync::Mutex::new(None),
@@ -239,7 +243,7 @@ impl DialogLayer {
                 .ok();
         }
 
-        let dlg_inner = DialogInner::new(
+        let mut dlg_inner = DialogInner::new(
             TransactionRole::Server,
             id.clone(),
             tx.original.clone(),
@@ -249,6 +253,7 @@ impl DialogLayer {
             local_contact,
             tx.tu_sender.clone(),
         )?;
+        dlg_inner.owned_state = true;
 
         *dlg_inner.remote_contact.lock() = tx.original.contact_header().ok().cloned();
 
@@ -320,7 +325,7 @@ impl DialogLayer {
                 .ok();
         }
 
-        let dlg_inner = DialogInner::new(
+        let mut dlg_inner = DialogInner::new(
             TransactionRole::Server,
             id.clone(),
             tx.original.clone(),
@@ -330,6 +335,7 @@ impl DialogLayer {
             local_contact,
             tx.tu_sender.clone(),
         )?;
+        dlg_inner.owned_state = true;
 
         *dlg_inner.remote_contact.lock() = tx.original.contact_header().ok().cloned();
         dlg_inner.set_server_connection(tx.connection.clone());
@@ -374,7 +380,7 @@ impl DialogLayer {
                 .ok();
         }
 
-        let dlg_inner = DialogInner::new(
+        let mut dlg_inner = DialogInner::new(
             TransactionRole::Server,
             id.clone(),
             tx.original.clone(),
@@ -384,6 +390,7 @@ impl DialogLayer {
             local_contact,
             tx.tu_sender.clone(),
         )?;
+        dlg_inner.owned_state = true;
 
         *dlg_inner.remote_contact.lock() = tx.original.contact_header().ok().cloned();
         dlg_inner.set_server_connection(tx.connection.clone());
@@ -423,7 +430,7 @@ impl DialogLayer {
                 .ok();
         }
 
-        let dlg_inner = DialogInner::new(
+        let mut dlg_inner = DialogInner::new(
             TransactionRole::Client,
             id.clone(),
             initial_request,
@@ -436,6 +443,7 @@ impl DialogLayer {
                 tx
             },
         )?;
+        dlg_inner.owned_state = true;
 
         let dialog = ClientPublicationDialog::new(Arc::new(dlg_inner));
         self.inner
@@ -471,7 +479,7 @@ impl DialogLayer {
                 .ok();
         }
 
-        let dlg_inner = DialogInner::new(
+        let mut dlg_inner = DialogInner::new(
             TransactionRole::Client,
             id.clone(),
             initial_request,
@@ -484,6 +492,7 @@ impl DialogLayer {
                 tx
             },
         )?;
+        dlg_inner.owned_state = true;
 
         let dialog = ClientSubscriptionDialog {
             inner: Arc::new(dlg_inner),
@@ -616,45 +625,142 @@ impl DialogLayer {
         state_sender: DialogStateSender,
         credential: Option<Credential>,
     ) -> crate::Result<bool> {
-        // Already restored?
-        if self.get_dialog(&snapshot.id).is_some() {
-            return Ok(false);
+        use super::recovery::RestoreOutcome;
+        match self.restore_from_snapshot_detailed(snapshot, state_sender, credential)
+            .map_err(|error| crate::Error::Error(error.to_string()))? {
+            RestoreOutcome::Restored(_) => Ok(true),
+            RestoreOutcome::AlreadyPresent(_) | RestoreOutcome::SkippedNonConfirmed(_) => Ok(false),
+            RestoreOutcome::RecoveryRequired(_) => Err(crate::Error::Error(
+                "dialog snapshot contains unfinished signaling; application recovery policy is required".into())),
         }
+    }
 
+    /// Apply an explicit termination policy to a saved confirmed dialog without
+    /// restoring it as a live session. Sends one fresh BYE using the stored
+    /// CSeq/routing and normal persistence barriers. Interrupted transactions are
+    /// never replayed; every checkpoint retains their pending evidence.
+    ///
+    /// A pending initial ACK is rejected: a fresh BYE cannot replace it.
+    /// The caller must own recovery of this dialog exclusively across processes.
+    /// Calls racing within this layer are rejected. Incoming requests for this
+    /// recovery-only leg are not admitted as requests on a confirmed session.
+    pub fn start_recovery_termination(
+        &self,
+        snapshot: DialogSnapshot,
+        state_sender: DialogStateSender,
+        credential: Option<Credential>,
+        headers: Option<Vec<crate::sip::Header>>,
+    ) -> crate::Result<super::operation::DialogOperation> {
+        if snapshot.runtime.pending.initial_ack {
+            return Err(crate::Error::Error(
+                "recovery termination cannot replace an unfinished initial ACK".into(),
+            ));
+        }
+        let id = snapshot.id.clone();
+        self.inner.dialogs.with_mut(|dialogs| {
+            let mut recovering = self.inner.recovery_operations.lock();
+            if dialogs.contains_key(&id) || !recovering.insert(id.clone()) {
+                return Err(crate::Error::Error(
+                    "dialog is already live or recovering".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        let admitted = (|| {
+            let mut inner = DialogInner::restore_snapshot_inner(
+                snapshot,
+                self.endpoint.clone(),
+                state_sender,
+                transaction_event_sender_noop(),
+                true,
+            )?
+            .ok_or_else(|| {
+                crate::Error::Error("recovery termination requires a confirmed snapshot".into())
+            })?;
+            inner.owned_state = true;
+            inner.credential = credential;
+            inner.lifecycle.lock().sender = self.inner.lifecycle_sender.lock().clone();
+            let inner = Arc::new(inner);
+            inner.configure_persistence(self.inner.persistence_config.lock().clone());
+            super::invite_dialog::InviteDialog::from_inner(inner)
+                .admit_request(crate::sip::Method::Bye, headers, None)
+                .map_err(|e| crate::Error::Error(e.to_string()))
+        })();
+        match admitted {
+            Ok(operation) => {
+                let observer = operation.clone();
+                let layer = self.inner.clone();
+                crate::platform::spawn(async move {
+                    observer.wait().await;
+                    layer.recovery_operations.lock().remove(&id);
+                });
+                Ok(operation)
+            }
+            Err(error) => {
+                self.inner.recovery_operations.lock().remove(&id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Restore without conflating a duplicate, unsupported state, and pending
+    /// signaling. A recovery-required outcome returns the entire saved record;
+    /// it never clears pending work or replays transactions. Existing dialogs
+    /// are preserved, including when two restore calls race.
+    pub fn restore_from_snapshot_detailed(
+        &self,
+        snapshot: DialogSnapshot,
+        state_sender: DialogStateSender,
+        credential: Option<Credential>,
+    ) -> core::result::Result<super::recovery::RestoreOutcome, super::recovery::RestoreError> {
+        use super::recovery::{RestoreError, RestoreOutcome};
+        if self.get_dialog(&snapshot.id).is_some() {
+            return Ok(RestoreOutcome::AlreadyPresent(snapshot.id));
+        }
+        if self.inner.recovery_operations.lock().contains(&snapshot.id) {
+            return Err(RestoreError::Initialization(
+                "dialog recovery is in progress".into(),
+            ));
+        }
+        if snapshot.state != super::dialog::DialogSnapshotState::Confirmed {
+            return Ok(RestoreOutcome::SkippedNonConfirmed(snapshot.state));
+        }
+        super::lifecycle::LifecycleState::restored(&snapshot.runtime)
+            .map_err(|error| RestoreError::InvalidLifecycle(error.to_string()))?;
+        if !snapshot.runtime.pending.is_empty() {
+            return Ok(RestoreOutcome::RecoveryRequired(Box::new(snapshot)));
+        }
         let tu_sender = transaction_event_sender_noop();
-
-        let Some(mut inner) = DialogInner::try_restore_from_snapshot(
+        let mut inner = DialogInner::try_restore_from_snapshot(
             snapshot,
             self.endpoint.clone(),
             state_sender,
             tu_sender,
-        )?
-        else {
-            // not confirmed -> ignored
-            return Ok(false);
-        };
-
+        )
+        .map_err(|error| RestoreError::Initialization(error.to_string()))?
+        .ok_or_else(|| RestoreError::Initialization("confirmed snapshot was skipped".into()))?;
+        inner.owned_state = true;
         inner.credential = credential;
         inner.lifecycle.lock().sender = self.inner.lifecycle_sender.lock().clone();
         let inner = Arc::new(inner);
         inner.configure_persistence(self.inner.persistence_config.lock().clone());
         *inner.reliable_config.lock() = self.inner.reliable_config.lock().clone();
         let dialog = Dialog::from_inner(inner.role, inner.clone());
-
         let key = dialog.id();
-
-        // Another restore or live dialog may have won while we built this one.
-        // Check and insert under the same registry lock, without replacing it.
-        Ok(self
-            .inner
-            .dialogs
-            .with_mut(|dialogs| match dialogs.entry(key) {
+        Ok(self.inner.dialogs.with_mut(|dialogs| {
+            if self.inner.recovery_operations.lock().contains(&key) {
+                return Err(RestoreError::Initialization(
+                    "dialog recovery is in progress".into(),
+                ));
+            }
+            Ok(match dialogs.entry(key.clone()) {
                 Entry::Vacant(entry) => {
                     entry.insert(dialog);
-                    true
+                    RestoreOutcome::Restored(key)
                 }
-                Entry::Occupied(_) => false,
-            }))
+                Entry::Occupied(_) => RestoreOutcome::AlreadyPresent(key),
+            })
+        })?)
     }
 
     pub fn remove_dialog(&self, id: &DialogId) {

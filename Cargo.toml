@@ -1,6 +1,6 @@
 [package]
 name = "rsipstack"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 description = "SIP Stack Rust library for building SIP applications"
 license = "MIT"
@@ -111,6 +111,10 @@ name = "interop_proxy"
 required-features = ["platform-tokio"]
 
 [[example]]
+name = "dialog_operations"
+required-features = ["platform-tokio"]
+
+[[example]]
 name = "interop_b2bua"
 required-features = ["platform-tokio"]
 
@@ -118,3 +122,6 @@ required-features = ["platform-tokio"]
 name = "prack_probe"
 path = "examples/prack_probe.rs"
 required-features = ["platform-tokio"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rsipstack_no_legacy)'] }

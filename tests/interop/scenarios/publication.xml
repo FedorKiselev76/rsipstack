@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<scenario name="Managed publication ETag and lifetime">
+  <recv request="PUBLISH"><action>
+    <ereg regexp="presence" search_in="hdr" header="Event:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=publication-peer
+[last_Call-ID:]
+[last_CSeq:]
+SIP-ETag: v1
+Expires: 30
+Record-Route: <sip:127.0.0.1:9;lr>
+Contact: <sip:127.0.0.1:9>
+Content-Length: 0
+
+]]></send>
+  <recv request="PUBLISH"><action>
+    <ereg regexp="presence" search_in="hdr" header="Event:" check_it="true" assign_to="_"/>
+    <ereg regexp="v1" search_in="hdr" header="SIP-If-Match:" check_it="true" assign_to="_"/>
+    <ereg regexp="^ *0" search_in="hdr" header="Content-Length:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=publication-peer
+[last_Call-ID:]
+[last_CSeq:]
+SIP-ETag: v2
+Expires: 30
+Record-Route: <sip:127.0.0.1:9;lr>
+Contact: <sip:127.0.0.1:9>
+Content-Length: 0
+
+]]></send>
+  <recv request="PUBLISH"><action>
+    <ereg regexp="presence" search_in="hdr" header="Event:" check_it="true" assign_to="_"/>
+    <ereg regexp="v2" search_in="hdr" header="SIP-If-Match:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=publication-peer
+[last_Call-ID:]
+[last_CSeq:]
+SIP-ETag: v3
+Expires: 30
+Record-Route: <sip:127.0.0.1:9;lr>
+Contact: <sip:127.0.0.1:9>
+Content-Length: 0
+
+]]></send>
+  <recv request="PUBLISH"><action>
+    <ereg regexp="presence" search_in="hdr" header="Event:" check_it="true" assign_to="_"/>
+    <ereg regexp="v3" search_in="hdr" header="SIP-If-Match:" check_it="true" assign_to="_"/>
+    <ereg regexp="^ *0" search_in="hdr" header="Content-Length:" check_it="true" assign_to="_"/>
+    <ereg regexp="^ *0" search_in="hdr" header="Expires:" check_it="true" assign_to="_"/>
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=publication-peer
+[last_Call-ID:]
+[last_CSeq:]
+SIP-ETag: v3
+Expires: 0
+Record-Route: <sip:127.0.0.1:9;lr>
+Contact: <sip:127.0.0.1:9>
+Content-Length: 0
+
+]]></send>
+</scenario>

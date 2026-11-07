@@ -16,6 +16,8 @@
 //! a SIP dialog does not establish a new timer agreement: applications must keep
 //! their recovery policy and renegotiate (or end the call) after a restart.
 
+#![deny(deprecated)]
+
 use super::{dialog::DialogInner, invite_dialog::InviteDialog, reinvite::AckBody};
 #[cfg(not(feature = "platform-tokio"))]
 use crate::platform::Instant;
@@ -562,6 +564,7 @@ impl SessionTimer {
         next.destination = tx.destination.clone();
         next.defer_success_ack = tx.defer_success_ack;
         next.force_success_ack = tx.force_success_ack;
+        next.operation = tx.operation.clone();
         // A 422 retry is a new transaction, but belongs to the same durable
         // dialog and must retain receipt timing for its initial acceptance.
         inner.bind_persistence(&next);
@@ -584,11 +587,16 @@ impl SessionTimer {
         self.expirations.fetch_add(1, Ordering::Relaxed);
         if let Some(inner) = self.dialog.upgrade() {
             let dialog = InviteDialog::from_inner(inner);
-            if let Err(error) = dialog
-                .bye_with_reason("SIP;cause=408;text=\"Session timer expired\"".into())
-                .await
-            {
-                tracing::warn!(%error, "session timer teardown failed");
+            match dialog.admit_termination(
+                super::termination::TerminationOptions::default()
+                    .with_reason("SIP;cause=408;text=\"Session timer expired\""),
+            ) {
+                Ok(operation) => {
+                    if let Err(error) = operation.wait().await.signaling_result() {
+                        tracing::warn!(%error, "session timer teardown failed");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "session timer teardown rejected"),
             }
         }
     }
@@ -639,7 +647,14 @@ impl SessionTimer {
         };
         self.refreshes.fetch_add(1, Ordering::Relaxed);
         if method == Method::Update {
-            return dialog.update(None, None).await;
+            let operation = dialog
+                .admit_request(Method::Update, None, None)
+                .map_err(|e| error(&e.to_string()))?;
+            let completion = operation.wait().await;
+            completion
+                .signaling_result()
+                .map_err(|e| error(&e.to_string()))?;
+            return Ok(completion.response().cloned());
         }
         let body = match &self.config.sdp {
             Some(provider) => provider.offer().await?,
@@ -650,11 +665,27 @@ impl SessionTimer {
         if body.body.is_empty() {
             return Err(error("empty session refresh SDP offer"));
         }
-        let request = dialog.prepare_reinvite(
-            Some(vec![Header::ContentType(body.content_type.into())]),
-            Some(body.body),
-        )?;
-        let response = dialog.send_reinvite(request, Default::default()).await?;
+        let operation = dialog
+            .admit_reinvite(
+                Some(vec![Header::ContentType(body.content_type.into())]),
+                Some(body.body),
+                Default::default(),
+            )
+            .map_err(|e| match e {
+                super::operation::AdmissionError::NegotiationInProgress => {
+                    crate::Error::DialogError(
+                        e.to_string(),
+                        dialog.id(),
+                        StatusCode::RequestPending,
+                    )
+                }
+                _ => error(&e.to_string()),
+            })?;
+        let completion = operation.wait().await;
+        completion
+            .signaling_result()
+            .map_err(|e| error(&e.to_string()))?;
+        let response = completion.response().cloned();
         if let (Some(provider), Some(response)) = (&self.config.sdp, &response) {
             if response.status_code.kind() == StatusCodeKind::Successful {
                 provider.answer(response).await?;

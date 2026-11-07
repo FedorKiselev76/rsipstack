@@ -69,10 +69,15 @@ use async_trait::async_trait;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DialogCheckpointReason {
+    /// An application explicitly changed the remote target through its setter.
+    TargetChanged,
     /// Before the first send of a transaction, including authenticated retries.
     OutgoingRequest,
     /// Local hangup/cancellation intent, before waiting for an ACK or peer.
     LocalTerminationRequested,
+    /// A BYE passed dialog validation. Its request and occurrence-time facts
+    /// can be committed with application state before the successful reply.
+    RemoteTerminationReceived,
     /// Before sending a final response to an incoming request.
     BeforeResponse,
     /// An INVITE final response was received; before its automatic ACK.
@@ -125,11 +130,53 @@ impl DialogPersistenceConfig {
     }
 }
 
+/// A persistence failure with a machine-readable commit-outcome distinction.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PersistenceFailure {
+    #[error("dialog persistence failed: {0}")]
+    Storage(String),
+    #[error("dialog persistence timed out; commit outcome is unknown")]
+    TimedOut,
+    #[error("dialog persistence worker stopped; commit outcome may be unknown")]
+    WorkerStopped,
+    #[error("checkpoint revision moved backwards")]
+    RevisionMovedBackwards,
+}
+impl PersistenceFailure {
+    /// Storage errors are application-reported failures; timeout/worker loss
+    /// cannot prove whether an already started write committed.
+    pub fn commit_outcome_unknown(&self) -> bool {
+        matches!(self, Self::TimedOut | Self::WorkerStopped)
+    }
+}
+
+/// A FIFO cutoff of already accepted writes, independent of snapshot revision.
+/// Creating it is synchronous; waiting or dropping the waiter does not admit or
+/// cancel any writes. It does not stop incoming signaling or drain transactions.
+#[must_use]
+pub struct PersistenceBarrier {
+    receiver: Option<mpsc::UnboundedReceiver<core::result::Result<(), PersistenceFailure>>>,
+}
+impl PersistenceBarrier {
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
+    pub async fn wait(mut self) -> core::result::Result<(), PersistenceFailure> {
+        match self.receiver.as_mut() {
+            None => Ok(()),
+            Some(receiver) => receiver
+                .recv()
+                .await
+                .unwrap_or(Err(PersistenceFailure::WorkerStopped)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct DialogPersistenceStatus {
     pub last_committed_revision: Option<u64>,
     pub failure: Option<String>,
+    pub failure_kind: Option<PersistenceFailure>,
 }
 
 type CommitResult = core::result::Result<(), String>;
@@ -140,21 +187,40 @@ struct Work {
     reply: mpsc::UnboundedSender<CommitResult>,
 }
 
+enum WorkItem {
+    Save(Work),
+    Barrier(mpsc::UnboundedSender<core::result::Result<(), PersistenceFailure>>),
+    Stop,
+}
+
 pub(crate) struct PersistenceRuntime {
-    sender: mpsc::UnboundedSender<Option<Work>>,
+    sender: mpsc::UnboundedSender<WorkItem>,
     pub status: Arc<Mutex<DialogPersistenceStatus>>,
 }
 
 impl PersistenceRuntime {
     #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     pub fn start(dialog: Weak<DialogInner>, config: DialogPersistenceConfig) -> Arc<Self> {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Option<Work>>();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<WorkItem>();
         let status = Arc::new(Mutex::new(DialogPersistenceStatus::default()));
         let worker_status = status.clone();
         // The worker never owns a strong dialog reference while awaiting storage.
         // Dropping the dialog queues a stop marker; pending writes have finite timeouts.
         crate::platform::spawn(async move {
-            while let Some(Some(work)) = receiver.recv().await {
+            while let Some(item) = receiver.recv().await {
+                let work = match item {
+                    WorkItem::Stop => break,
+                    WorkItem::Barrier(reply) => {
+                        let result = worker_status
+                            .lock()
+                            .failure_kind
+                            .clone()
+                            .map_or(Ok(()), Err);
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                    WorkItem::Save(work) => work,
+                };
                 let revision = work.checkpoint.snapshot.runtime.revision;
                 let sequence = work
                     .checkpoint
@@ -164,13 +230,13 @@ impl PersistenceRuntime {
                     .last()
                     .map_or(0, |fact| fact.sequence);
                 let previous = worker_status.lock().clone();
-                let result = if let Some(error) = previous.failure {
+                let result = if let Some(error) = previous.failure_kind {
                     Err(error)
                 } else if previous
                     .last_committed_revision
                     .is_some_and(|r| r > revision)
                 {
-                    Err("checkpoint revision moved backwards".into())
+                    Err(PersistenceFailure::RevisionMovedBackwards)
                 } else if work.checkpoint.reason == DialogCheckpointReason::Terminated
                     && previous.last_committed_revision == Some(revision)
                 {
@@ -183,10 +249,8 @@ impl PersistenceRuntime {
                     .await
                     {
                         Ok(Ok(())) => Ok(()),
-                        Ok(Err(error)) => Err(format!("dialog persistence failed: {error}")),
-                        Err(_) => {
-                            Err("dialog persistence timed out; commit outcome is unknown".into())
-                        }
+                        Ok(Err(error)) => Err(PersistenceFailure::Storage(error.to_string())),
+                        Err(_) => Err(PersistenceFailure::TimedOut),
                     }
                 };
                 match &result {
@@ -197,14 +261,30 @@ impl PersistenceRuntime {
                         }
                     }
                     Err(error) => {
-                        worker_status.lock().failure = Some(error.clone());
+                        {
+                            let mut status = worker_status.lock();
+                            status.failure = Some(error.to_string());
+                            status.failure_kind = Some(error.clone());
+                        }
                         tracing::warn!(%error, revision, "dialog persistence stopped");
                     }
                 }
-                let _ = work.reply.send(result);
+                let _ = work.reply.send(result.map_err(|error| error.to_string()));
             }
         });
         Arc::new(Self { sender, status })
+    }
+
+    fn barrier(&self) -> PersistenceBarrier {
+        let (reply, receiver) = mpsc::unbounded_channel();
+        if let Err(error) = self.sender.send(WorkItem::Barrier(reply)) {
+            if let WorkItem::Barrier(reply) = error.0 {
+                let _ = reply.send(Err(PersistenceFailure::WorkerStopped));
+            }
+        }
+        PersistenceBarrier {
+            receiver: Some(receiver),
+        }
     }
 
     /// Enqueue while the snapshot gate is held; user code runs in the worker.
@@ -214,8 +294,8 @@ impl PersistenceRuntime {
             let _ = reply.send(Err(error));
             return receiver;
         }
-        if let Err(error) = self.sender.send(Some(Work { checkpoint, reply })) {
-            if let Some(work) = error.0 {
+        if let Err(error) = self.sender.send(WorkItem::Save(Work { checkpoint, reply })) {
+            if let WorkItem::Save(work) = error.0 {
                 let _ = work
                     .reply
                     .send(Err("dialog persistence worker stopped".into()));
@@ -226,6 +306,17 @@ impl PersistenceRuntime {
 }
 
 impl DialogInner {
+    pub(crate) fn persistence_barrier(&self) -> PersistenceBarrier {
+        // The same gate orders checkpoint submission and this cutoff.
+        let _state = self.state.lock();
+        self.persistence
+            .lock()
+            .as_ref()
+            .map_or(PersistenceBarrier { receiver: None }, |runtime| {
+                runtime.barrier()
+            })
+    }
+
     pub(crate) fn configure_persistence(self: &Arc<Self>, config: Option<DialogPersistenceConfig>) {
         if let Some(config) = config {
             *self.persistence_owner.lock() = Arc::downgrade(self);
@@ -294,6 +385,137 @@ impl Drop for PersistenceRuntime {
     fn drop(&mut self) {
         // Also works on runtimes whose channels do not close on last-sender drop.
         // FIFO drains already accepted writes before stopping the worker.
-        let _ = self.sender.send(None);
+        let _ = self.sender.send(WorkItem::Stop);
+    }
+}
+
+#[cfg(all(test, feature = "platform-tokio"))]
+mod barrier_tests {
+    use super::*;
+    use crate::{
+        dialog::{dialog::DialogSnapshotState, snapshot::DialogSnapshotRuntime, DialogId},
+        sip::ToTypedHeader,
+        transaction::key::TransactionRole,
+    };
+    use tokio::sync::{mpsc, oneshot};
+    struct Storage(mpsc::UnboundedSender<oneshot::Sender<crate::Result<()>>>);
+    #[async_trait]
+    impl DialogPersistence for Storage {
+        async fn save(&self, _: DialogCheckpoint) -> crate::Result<()> {
+            let (reply, result) = oneshot::channel();
+            self.0.send(reply).unwrap();
+            result.await.unwrap()
+        }
+    }
+    fn checkpoint() -> DialogCheckpoint {
+        let snapshot = DialogSnapshot::builder(
+            DialogId {
+                call_id: "barrier".into(),
+                local_tag: "local".into(),
+                remote_tag: "peer".into(),
+            },
+            TransactionRole::Client,
+            crate::sip::From::from("<sip:local@localhost>;tag=local")
+                .typed()
+                .unwrap(),
+            crate::sip::To::from("<sip:peer@localhost>;tag=peer")
+                .typed()
+                .unwrap(),
+            "sip:peer@localhost".try_into().unwrap(),
+        )
+        .state(DialogSnapshotState::Confirmed)
+        .local_cseq(1)
+        .remote_cseq(0)
+        .runtime(DialogSnapshotRuntime::default())
+        .build()
+        .unwrap();
+        DialogCheckpoint {
+            snapshot,
+            reason: DialogCheckpointReason::BeforeAck,
+            message: None,
+        }
+    }
+    fn worker(
+        timeout: Duration,
+    ) -> (
+        Arc<PersistenceRuntime>,
+        mpsc::UnboundedReceiver<oneshot::Sender<crate::Result<()>>>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut config = DialogPersistenceConfig::new(Arc::new(Storage(sender)));
+        config.timeout = timeout;
+        (PersistenceRuntime::start(Weak::new(), config), receiver)
+    }
+    #[tokio::test]
+    async fn barrier_covers_same_revision_writes_but_not_later_work() {
+        let (runtime, mut writes) = worker(Duration::from_secs(2));
+        let _first = runtime.submit(checkpoint());
+        let _second = runtime.submit(checkpoint());
+        let barrier = runtime.barrier();
+        let _third = runtime.submit(checkpoint());
+        let waiting = tokio::spawn(barrier.wait());
+        writes.recv().await.unwrap().send(Ok(())).unwrap();
+        let second = writes.recv().await.unwrap();
+        assert_eq!(runtime.status.lock().last_committed_revision, Some(0));
+        assert!(
+            !waiting.is_finished(),
+            "revision 0 does not cover the second write"
+        );
+        second.send(Ok(())).unwrap();
+        let third = writes.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        third.send(Ok(())).unwrap();
+        runtime.barrier().wait().await.unwrap();
+    }
+    #[tokio::test]
+    async fn dropped_waiter_and_runtime_still_drain_accepted_writes() {
+        let (runtime, mut writes) = worker(Duration::from_secs(2));
+        let mut result = runtime.submit(checkpoint());
+        drop(runtime.barrier());
+        drop(runtime);
+        writes.recv().await.unwrap().send(Ok(())).unwrap();
+        assert!(result.recv().await.unwrap().is_ok());
+        assert!(
+            writes.recv().await.is_none(),
+            "worker must release storage after drain"
+        );
+    }
+    #[tokio::test]
+    async fn barrier_exposes_storage_failure_and_poisoned_queue() {
+        let (runtime, mut writes) = worker(Duration::from_secs(2));
+        let _result = runtime.submit(checkpoint());
+        let barrier = runtime.barrier();
+        writes
+            .recv()
+            .await
+            .unwrap()
+            .send(Err(crate::Error::Error("disk failure".into())))
+            .unwrap();
+        assert!(matches!(
+            barrier.wait().await,
+            Err(PersistenceFailure::Storage(_))
+        ));
+        let mut rejected = runtime.submit(checkpoint());
+        assert!(rejected.recv().await.unwrap().is_err());
+        assert!(matches!(
+            runtime.barrier().wait().await,
+            Err(PersistenceFailure::Storage(_))
+        ));
+        assert!(writes.try_recv().is_err());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn barrier_timeout_reports_unknown_commit_outcome() {
+        let (runtime, mut writes) = worker(Duration::from_secs(1));
+        let _result = runtime.submit(checkpoint());
+        let barrier = runtime.barrier();
+        let _blocked = writes.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = barrier.wait().await.unwrap_err();
+        assert_eq!(error, PersistenceFailure::TimedOut);
+        assert!(error.commit_outcome_unknown());
     }
 }

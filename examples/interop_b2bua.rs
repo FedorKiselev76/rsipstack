@@ -10,7 +10,7 @@ use rsipstack::{
         invite_dialog::InviteDialog,
     },
     sip::{prelude::HeadersExt, Header, Method, Response, StatusCode, Uri},
-    transaction::{Transaction, TransactionState, TransactionType},
+    transaction::Transaction,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -53,16 +53,8 @@ async fn main() -> AppResult {
     app.run(move || layer.len()).await
 }
 
-async fn drive(mut dialog: Dialog, mut tx: Transaction) -> AppResult {
-    dialog.handle(&mut tx).await?;
-    if tx.transaction_type == TransactionType::ServerInvite
-        && matches!(
-            tx.state,
-            TransactionState::Completed | TransactionState::Confirmed
-        )
-    {
-        while tx.receive().await.is_some() {}
-    }
+async fn drive(dialog: Dialog, tx: Transaction) -> AppResult {
+    dialog.start_incoming_request(tx)?.wait().await?;
     Ok(())
 }
 
@@ -80,15 +72,17 @@ fn start_call(
     tasks: Tasks,
 ) -> AppResult {
     let (states, mut receiver) = layer.new_dialog_state_channel();
-    let a = layer.get_or_create_server_invite(&tx, states.clone(), None, Some(contact.clone()))?;
+    let original = tx.original.clone();
+    let incoming = layer.start_incoming_invite(tx, states.clone(), Some(contact.clone()))?;
+    let a = incoming.dialog();
     let a_id = a.id().call_id.to_string();
     let (b, invite_task) = layer.do_invite_async(
         InviteOption {
-            caller: tx.original.from_header()?.uri()?,
+            caller: original.from_header()?.uri()?,
             callee: target,
             contact,
-            offer: Some(tx.original.body.clone()),
-            content_type: tx.original.headers.iter().find_map(|h| match h {
+            offer: Some(original.body.clone()),
+            content_type: original.headers.iter().find_map(|h| match h {
                 Header::ContentType(value) => Some(value.value().to_owned()),
                 _ => None,
             }),
@@ -117,7 +111,10 @@ fn start_call(
             .map_err(|_| "Bridge stopped before the INVITE completed")?;
         Ok(())
     });
-    tasks.spawn("initial dialog", drive(Dialog::Invite(a.clone()), tx));
+    tasks.spawn("initial dialog", async move {
+        incoming.wait().await?;
+        Ok(())
+    });
     let actor_tasks = tasks.clone();
     tasks.spawn("bridge", async move {
         bridge(a, b, event_rx, layer, calls, actor_tasks).await

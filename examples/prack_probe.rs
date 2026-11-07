@@ -83,8 +83,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let router = layer.clone();
     tokio::spawn(async move {
         while let Some(mut tx) = incoming.recv().await {
-            if let Some(mut dialog) = router.match_dialog(&tx) {
-                tokio::spawn(async move { dialog.handle(&mut tx).await });
+            if let Some(dialog) = router.match_dialog(&tx) {
+                if let Ok(operation) = dialog.start_incoming_request(tx) {
+                    tokio::spawn(async move { operation.wait().await });
+                }
             } else {
                 tx.reply(rsipstack::sip::StatusCode::CallTransactionDoesNotExist)
                     .await
