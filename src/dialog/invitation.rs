@@ -147,6 +147,9 @@ pub struct InviteOption {
     /// `Content-Type` here replaces the one the stack would add, so it is
     /// never sent twice; a `Content-Type` here wins over `content_type`.
     pub headers: Option<Vec<crate::sip::Header>>,
+    /// Legacy client-side advertisement switch. For full UAC/UAS support,
+    /// configure `DialogLayer::set_reliable_provisional` with a `PrackHandler`.
+    /// That configuration also advertises 100rel; this flag can remain false.
     pub support_prack: bool,
     pub call_id: Option<String>,
     /// RFC 7989: local Session-ID UUID for this call (32 hex chars; dashed
@@ -179,7 +182,7 @@ impl DialogGuard {
 
 impl Drop for DialogGuard {
     fn drop(&mut self) {
-        let dlg = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
+        let dlg = match self.dialog_layer_inner.dialogs.remove(&self.id) {
             Some(dlg) => dlg,
             None => return,
         };
@@ -208,7 +211,7 @@ impl Drop for DialogGuardForUnconfirmed {
         if self.dialog.is_none() {
             return;
         }
-        let client_dialog = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
+        let client_dialog = match self.dialog_layer_inner.dialogs.remove(&self.id) {
             Some(Dialog::Invite(client_dialog)) => client_dialog,
             Some(_) => return,
             // The application already removed the dialog from the layer
@@ -493,7 +496,13 @@ impl DialogLayer {
                 .into(),
         ));
 
-        if opt.support_prack {
+        if let Some(config) = self.inner.reliable_config.lock().as_ref() {
+            super::reliable::add_option(&mut request, "Supported", "100rel");
+            if config.require {
+                super::reliable::add_option(&mut request, "Require", "100rel");
+            }
+        }
+        if opt.support_prack && !request.header_contains_token("Supported", "100rel") {
             request
                 .headers
                 .unique_push(crate::sip::Header::Supported("100rel".into()));
@@ -541,6 +550,9 @@ impl DialogLayer {
                     _ => request.headers.push(header.clone()),
                 }
             }
+        }
+        if let Some(config) = self.inner.session_timer_config.lock().as_ref() {
+            config.initial(&mut request);
         }
         Ok(request)
     }
@@ -676,7 +688,7 @@ impl DialogLayer {
 
         self.inner
             .dialogs
-            .insert(id.to_string(), Dialog::Invite(dialog.clone()));
+            .insert(id.clone(), Dialog::Invite(dialog.clone()));
 
         let mut guard = DialogGuardForUnconfirmed {
             dialog_layer_inner: self.inner.clone(),
@@ -694,15 +706,15 @@ impl DialogLayer {
         let r = dialog
             .process_invite_with_registration(tx, |new_id| {
                 self.inner.dialogs.with_mut(|dialogs| {
-                    dialogs.remove(&id.to_string());
-                    dialogs.insert(new_id.to_string(), Dialog::Invite(dialog.clone()));
+                    dialogs.remove(&id);
+                    dialogs.insert(new_id.clone(), Dialog::Invite(dialog.clone()));
                 });
             })
             .boxed()
             .await;
         guard.dialog = None;
         if !dialog.inner.is_confirmed() {
-            self.inner.dialogs.remove(&id.to_string());
+            self.inner.dialogs.remove(&id);
         }
 
         match r {
@@ -771,7 +783,7 @@ impl DialogLayer {
         // 1) register early key (so in-dialog requests can be matched)
         self.inner
             .dialogs
-            .insert(id0.to_string(), Dialog::Invite(dialog.clone()));
+            .insert(id0.clone(), Dialog::Invite(dialog.clone()));
 
         let inner = self.inner.clone();
         let dialog_clone = dialog.clone();
@@ -796,8 +808,8 @@ impl DialogLayer {
             let r = dialog_clone
                 .process_invite_with_registration(invite_tx, |new_id| {
                     inner.dialogs.with_mut(|dialogs| {
-                        dialogs.remove(&id0.to_string());
-                        dialogs.insert(new_id.to_string(), Dialog::Invite(dialog_clone.clone()));
+                        dialogs.remove(&id0);
+                        dialogs.insert(new_id.clone(), Dialog::Invite(dialog_clone.clone()));
                     });
                 })
                 .boxed()
@@ -809,7 +821,7 @@ impl DialogLayer {
                 .expect("transaction should be available");
 
             if !dialog_clone.inner.is_confirmed() {
-                inner.dialogs.remove(&id0.to_string());
+                inner.dialogs.remove(&id0);
             }
 
             match &r {
@@ -901,7 +913,15 @@ impl DialogLayer {
         }
         let dialog = InviteDialog::from_inner(Arc::new(dlg_inner));
         dialog.inner.lifecycle.lock().sender = self.inner.lifecycle_sender.lock().clone();
+        dialog
+            .inner
+            .configure_persistence(self.inner.persistence_config.lock().clone());
+        dialog.inner.bind_persistence(&tx);
         dialog.inner.reserve_invite(&tx)?;
+        *dialog.inner.reliable_config.lock() = self.inner.reliable_config.lock().clone();
+        if let Some(config) = self.inner.session_timer_config.lock().clone() {
+            super::session_timer::SessionTimer::install(&dialog.inner, config);
+        }
         Ok((dialog, tx))
     }
 }

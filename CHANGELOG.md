@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — proposed 0.9.0
+
+- Opt-in persistence now saves every INVITE final response before its ACK,
+  including rejection and authentication challenges. A successful re-INVITE
+  checkpoint contains the accepted Contact and the observed response in one
+  coherent snapshot boundary. Failed writes continue to block protected sends.
+
+- **Breaking (requires maintainer approval for 0.9.0):** `DialogSnapshot` adds
+  coherent `runtime` metadata and becomes `#[non_exhaustive]`. External callers
+  must use `DialogSnapshot::builder(...)` and include `..` in destructuring
+  patterns. State, both CSeq values and runtime metadata must be explicit.
+- **Recovery behavior:** confirmed snapshots with unfinished signaling or invalid
+  lifecycle history are rejected. Stored transactions and handlers are not
+  replayed. Lifecycle records can be reconstructed with `DialogLifecycleRecord::new`.
+- See [the migration guide](MIGRATING-0.9.md) for storage defaults, legacy-record
+  handling, and the release compatibility plan. The release target is proposed;
+  this change does not itself bump or publish the package version.
+
+- Dialog registries now use the complete `DialogId` (Call-ID, local tag,
+  remote tag) as their key. Hyphens in these components can no longer make
+  distinct dialogs collide during registration, lookup, removal, or restore.
+- New `DialogLayer::dialog_ids()` enumerates structured identities. Existing
+  signatures and the `DialogId` display format remain unchanged. The legacy
+  `get_dialog_with(&String)` scans display strings and returns `None` for an
+  ambiguous match; `all_dialog_ids()` can contain duplicate display strings.
+  Applications using strings as identity keys should retain the three fields
+  and use `get_dialog(&DialogId)` instead.
+
+- Both original UAC and UAS INVITE dialogs now reply `500` to incoming
+  requests with a lower remote CSeq (RFC 3261 section 12.2.2). Previously
+  UAS dialogs silently discarded them. Rejected requests do not reach the
+  application or change the remote sequence/target. ACK and CANCEL remain
+  exempt from dialog sequence advancement. Public signatures are unchanged.
+
+- In-dialog requests and successful INVITE ACKs now support strict routing
+  (RFC 3261 section 12.2.1.1): the first strict route becomes the Request-URI
+  and remains the network next hop; the remote target is appended to Route.
+  Dialog transactions retain the original route set across authentication
+  retries and target refresh, including offerless re-INVITE ACK answers.
+  Route parameters and multiple values per header are preserved. Public
+  signatures are unchanged; direct `Request::destination()` remains a raw
+  message helper without dialog routing context.
+
+- Client INVITE transactions retain exact ACKs separately for each dialog
+  identity and CSeq. Alternating forked 2xx retransmissions reuse their own
+  Via branch, SDP body, routes, and destination, including after the owner
+  drops the transaction. The finished cache expires with TimerCleanup.
+  An unknown fork after drop is no longer acknowledged by rewriting another
+  fork's ACK; keep driving the Accepted transaction to handle new forks.
+  The public `last_ack` field remains the most recently prepared/sent ACK.
+
 ## 0.8.1
 
 Fourteen fixes and additions merged (#223–#236).
