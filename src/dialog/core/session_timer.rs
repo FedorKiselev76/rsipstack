@@ -814,8 +814,10 @@ impl DialogInner {
             let response = self.make_response(&tx.original, status.clone(), Some(headers), None);
             tx.respond(response).await?;
             if !self.is_confirmed() {
+                // The terminal checkpoint reads the identity again while taking its snapshot.
+                let id = self.id.lock().clone();
                 self.transition(super::dialog::DialogState::Terminated(
-                    self.id.lock().clone(),
+                    id,
                     super::dialog::TerminatedReason::UasOther(status),
                 ));
             }

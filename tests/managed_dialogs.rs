@@ -5,10 +5,15 @@ use rsipstack::{
     dialog::v2managed::{
         dialog_layer::DialogLayer,
         events::{DialogEvent, DialogNotification},
+        DialogCheckpoint, DialogCheckpointReason, DialogPersistence, DialogPersistenceConfig,
+        DialogSnapshot, DialogSnapshotState, SessionTimerConfig,
     },
     sip::{Header, HeadersExt, Method, Request, Response, SipMessage, StatusCode},
-    transaction::EndpointBuilder,
-    transport::{udp::UdpConnection, TransportLayer},
+    transaction::{
+        key::{TransactionKey, TransactionRole},
+        EndpointBuilder, Transaction,
+    },
+    transport::{channel::ChannelConnection, udp::UdpConnection, TransportEvent, TransportLayer},
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
@@ -140,10 +145,6 @@ async fn managed_early_bye_finishes_the_owned_invite_and_retires_the_registry() 
 
 #[tokio::test]
 async fn closed_layer_returns_the_unconsumed_initial_transaction() -> Result {
-    use rsipstack::transaction::{
-        key::{TransactionKey, TransactionRole},
-        Transaction,
-    };
     let endpoint = EndpointBuilder::new().build();
     let layer = DialogLayer::new(endpoint.inner.clone());
     let (events, _receiver) = layer.new_dialog_event_channel();
@@ -158,5 +159,72 @@ async fn closed_layer_returns_the_unconsumed_initial_transaction() -> Result {
     assert_eq!(error.transaction.unwrap().original, request);
     assert!(layer.is_empty());
     assert!(layer.drain(Duration::from_millis(20)).await.is_drained());
+    Ok(())
+}
+
+struct TerminalSnapshots(mpsc::UnboundedSender<DialogSnapshot>);
+#[async_trait::async_trait]
+impl DialogPersistence for TerminalSnapshots {
+    async fn save(&self, checkpoint: DialogCheckpoint) -> rsipstack::Result<()> {
+        if checkpoint.reason == DialogCheckpointReason::Terminated {
+            self.0.send(checkpoint.snapshot).unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn session_timer_rejection_persists_the_terminated_dialog() -> Result {
+    // An async timeout cannot fire if the runtime itself is blocked on a dialog mutex.
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(check_timer_rejections());
+    });
+    result.recv_timeout(Duration::from_secs(5))?
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn check_timer_rejections() -> Result {
+    for (config, expected) in [(None, 420), (Some(SessionTimerConfig::default()), 422)] {
+        let endpoint = EndpointBuilder::new().build();
+        let layer = DialogLayer::new(endpoint.inner.clone());
+        layer.set_session_timer(config)?;
+        let (saved, mut snapshots) = mpsc::unbounded_channel();
+        layer.set_persistence(Some(DialogPersistenceConfig::new(Arc::new(
+            TerminalSnapshots(saved),
+        ))))?;
+
+        let (wire, mut responses) = mpsc::unbounded_channel();
+        let remote = "127.0.0.1:5060".parse::<std::net::SocketAddr>()?;
+        let conn = ChannelConnection::create_connection(
+            mpsc::unbounded_channel().1,
+            wire,
+            remote.into(),
+            None,
+        )
+        .await?;
+        let request = Request::try_from(concat!(
+            "INVITE sip:local@localhost SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-timer\r\n",
+            "From: <sip:peer@localhost>;tag=peer\r\nTo: <sip:local@localhost>\r\nCall-ID: timer-reject\r\n",
+            "CSeq: 1 INVITE\r\nContact: <sip:peer@localhost>\r\nRequire: timer\r\nSession-Expires: 60\r\nContent-Length: 0\r\n\r\n",
+        ))?;
+        let key = TransactionKey::from_request(&request, TransactionRole::Server)?;
+        let tx = Transaction::new_server(key, request, endpoint.inner.clone(), Some(conn.into()));
+        let (events, _receiver) = layer.new_dialog_event_channel();
+        let incoming =
+            layer.start_incoming_invite(tx, events, Some("sip:local@localhost".parse()?))?;
+        incoming.wait().await?;
+        let Some(TransportEvent::Incoming(SipMessage::Response(response), _, _)) =
+            responses.recv().await
+        else {
+            return Err("expected INVITE rejection".into());
+        };
+        assert_eq!(response.status_code.code(), expected);
+        let dialog = incoming.dialog();
+        dialog.persistence_barrier().wait().await?;
+        let snapshot = snapshots.try_recv()?;
+        assert_eq!(snapshot.id, dialog.id());
+        assert_eq!(snapshot.state, DialogSnapshotState::Terminated);
+    }
     Ok(())
 }
